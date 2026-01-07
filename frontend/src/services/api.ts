@@ -11,6 +11,8 @@ export const chatAPI = {
       document_ids: options?.documentIds,
       core_area: options?.coreArea,
       factory: options?.factory
+    }, {
+      timeout: 120000 // 2 minute timeout
     }),
   
   getHistory: (limit: number = 50) =>

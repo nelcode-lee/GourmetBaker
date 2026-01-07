@@ -18,7 +18,9 @@ async def get_db_pool() -> asyncpg.Pool:
             settings.DATABASE_URL,
             min_size=5,
             max_size=20,
-            command_timeout=60
+            command_timeout=60,
+            max_queries=50000,  # Maximum number of queries in a connection's lifetime
+            max_inactive_connection_lifetime=300.0  # Close connections after 5 minutes of inactivity
         )
     return _pool
 

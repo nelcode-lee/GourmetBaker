@@ -70,6 +70,16 @@ export default function ChatInterface() {
       // Refresh history to show the new query in recent queries
       refetchHistory()
     },
+    onError: (error: any) => {
+      console.error('Query error:', error)
+      setMessages(prev => [
+        ...prev,
+        { 
+          type: 'assistant', 
+          content: `Error: ${error.response?.data?.detail || error.message || 'Failed to process query. Please try again.'}` 
+        }
+      ])
+    },
   })
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -125,8 +135,27 @@ export default function ChatInterface() {
               disabled={mutation.isPending || !query.trim()}
               className="px-8 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium text-base shadow-md"
             >
-              Send
+              {mutation.isPending ? 'Processing...' : 'Send'}
             </button>
+            {mutation.isPending && (
+              <button
+                type="button"
+                onClick={() => {
+                  mutation.reset()
+                  setMessages(prev => {
+                    // Remove the last user message if it's still waiting for a response
+                    const lastMessage = prev[prev.length - 1]
+                    if (lastMessage && lastMessage.type === 'user') {
+                      return prev.slice(0, -1)
+                    }
+                    return prev
+                  })
+                }}
+                className="px-4 py-2 text-sm text-red-600 hover:text-red-700 underline"
+              >
+                Cancel
+              </button>
+            )}
           </div>
           
           {/* Active filters display */}
@@ -186,10 +215,18 @@ export default function ChatInterface() {
       </form>
       
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {messages.length === 0 && (
+        {messages.length === 0 && !mutation.isPending && (
           <div className="text-center text-gray-500 mt-8">
             <p className="text-lg">Ask a question about your documents</p>
             <p className="text-sm mt-2">Upload documents first to get started</p>
+          </div>
+        )}
+        {mutation.isPending && (
+          <div className="flex justify-center items-center py-8">
+            <div className="flex flex-col items-center gap-2">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+              <p className="text-sm text-gray-500">Processing your query...</p>
+            </div>
           </div>
         )}
         {messages.map((msg, idx) => (
