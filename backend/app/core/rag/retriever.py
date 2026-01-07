@@ -67,12 +67,22 @@ class HybridRetriever:
         """
         # Step 1: Query expansion (if learning enabled)
         expanded_query = query_text
-        if self.use_learning:
-            expanded_query = await self.learning_service.expand_query(query_text)
+        if self.use_learning and self.learning_service:
+            try:
+                expanded_query = await self.learning_service.expand_query(query_text)
+            except Exception as e:
+                import logging
+                logging.warning(f"Query expansion failed, using original query: {e}")
+                expanded_query = query_text
         
         # Step 2: Get adaptive weights (if learning enabled)
-        if self.use_learning:
-            self.vector_weight, self.keyword_weight = await self.learning_service.get_adaptive_weights()
+        if self.use_learning and self.learning_service:
+            try:
+                self.vector_weight, self.keyword_weight = await self.learning_service.get_adaptive_weights()
+            except Exception as e:
+                import logging
+                logging.warning(f"Adaptive weights failed, using defaults: {e}")
+                # Keep default weights
         
         # Get results from both searches
         vector_results = await self._vector_search(
@@ -99,26 +109,75 @@ class HybridRetriever:
         
         # Normalize scores and combine
         final_results = []
+        
+        # Normalize vector scores if we have any
+        if vector_results:
+            max_vector = max(score for _, score in vector_results) or 1.0
+            min_vector = min(score for _, score in vector_results) or 0.0
+            vector_range = max_vector - min_vector if max_vector > min_vector else 1.0
+        else:
+            vector_range = 1.0
+        
+        # Normalize keyword scores if we have any
+        if keyword_results:
+            max_keyword = max(score for _, score in keyword_results) or 1.0
+            min_keyword = min(score for _, score in keyword_results) or 0.0
+            keyword_range = max_keyword - min_keyword if max_keyword > min_keyword else 1.0
+        else:
+            keyword_range = 1.0
+        
         for chunk_id, scores in combined_scores.items():
-            # Normalize to 0-1 range (assuming scores are already in reasonable range)
-            vector_score = min(max(scores["vector"], 0), 1)
-            keyword_score = min(max(scores["keyword"], 0), 1)
+            # Normalize scores to 0-1 range
+            vector_score = scores["vector"]
+            keyword_score = scores["keyword"]
             
-            # Combine with weights
-            combined_score = (
-                self.vector_weight * vector_score +
-                self.keyword_weight * keyword_score
-            )
+            # Normalize vector score
+            if vector_range > 0:
+                vector_score = (vector_score - (min(score for _, score in vector_results) if vector_results else 0)) / vector_range
+            vector_score = min(max(vector_score, 0), 1)
+            
+            # Normalize keyword score
+            if keyword_range > 0:
+                keyword_score = (keyword_score - (min(score for _, score in keyword_results) if keyword_results else 0)) / keyword_range
+            keyword_score = min(max(keyword_score, 0), 1)
+            
+            # Combine with weights - boost keyword matches for specific queries
+            # If keyword score is high, it's likely a good match
+            if keyword_score > 0.5:
+                # Boost keyword-heavy matches
+                combined_score = (
+                    self.vector_weight * vector_score * 0.7 +  # Slightly reduce vector weight
+                    self.keyword_weight * keyword_score * 1.3  # Boost keyword weight
+                )
+            else:
+                combined_score = (
+                    self.vector_weight * vector_score +
+                    self.keyword_weight * keyword_score
+                )
+            
+            # Ensure minimum score if either search found something
+            if vector_score > 0 or keyword_score > 0:
+                combined_score = max(combined_score, 0.15)  # Minimum 0.15 if any match
             
             final_results.append((chunk_id, combined_score))
         
         # Apply document prioritization (if learning enabled)
-        if self.use_learning and document_ids:
-            final_results = await self._apply_document_prioritization(final_results, document_ids)
+        if self.use_learning and self.learning_service and document_ids:
+            try:
+                final_results = await self._apply_document_prioritization(final_results, document_ids)
+            except Exception as e:
+                import logging
+                logging.warning(f"Document prioritization failed: {e}")
+                # Continue without prioritization
         
         # Apply feedback-based boosting if enabled
         if self.use_feedback:
-            final_results = await self._apply_feedback_boosting(final_results)
+            try:
+                final_results = await self._apply_feedback_boosting(final_results)
+            except Exception as e:
+                import logging
+                logging.warning(f"Feedback boosting failed: {e}")
+                # Continue without boosting
         
         # Sort by combined score and get top_k
         final_results.sort(key=lambda x: x[1], reverse=True)
@@ -220,13 +279,26 @@ class HybridRetriever:
     ) -> List[Tuple[str, float]]:
         """
         Keyword search using PostgreSQL full-text search
-        Simple implementation using ILIKE for now
-        (Can be enhanced with proper full-text search indexes)
+        Enhanced to handle multi-word phrases and improve scoring
         """
-        # Extract keywords from query
-        keywords = [k.strip() for k in query_text.lower().split() if k.strip()]
+        import re
         
-        if not keywords:
+        # Extract keywords from query - keep important phrases together
+        # Remove common stop words but keep important terms
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'what', 'are', 'were', 'was'}
+        words = re.findall(r'\b[a-z0-9]+\b', query_text.lower())
+        keywords = [w for w in words if w not in stop_words and len(w) > 2]
+        
+        # Also try to match common phrases (2-3 word combinations)
+        phrases = []
+        if len(words) >= 2:
+            # Extract 2-word phrases
+            for i in range(len(words) - 1):
+                phrase = f"{words[i]} {words[i+1]}"
+                if all(w not in stop_words for w in words[i:i+2]):
+                    phrases.append(phrase)
+        
+        if not keywords and not phrases:
             return []
         
         async with self.db.acquire() as conn:
@@ -254,27 +326,63 @@ class HybridRetriever:
                 params.append(factory)
                 param_idx += 1
             
-            # Keyword search conditions
+            # Keyword search conditions - phrases get higher weight
+            keyword_conditions = []
             for keyword in keywords:
-                conditions.append(f"dc.content ILIKE ${param_idx}")
+                keyword_conditions.append(f"dc.content ILIKE ${param_idx}")
                 params.append(f"%{keyword}%")
                 param_idx += 1
             
+            # Phrase conditions (exact phrase matching gets higher score)
+            phrase_conditions = []
+            for phrase in phrases[:3]:  # Limit to top 3 phrases
+                phrase_conditions.append(f"dc.content ILIKE ${param_idx}")
+                params.append(f"%{phrase}%")
+                param_idx += 1
+            
             where_clause = " AND ".join(base_conditions)
-            if conditions:
-                where_clause += " AND (" + " OR ".join(conditions) + ")"
+            all_conditions = []
+            if keyword_conditions:
+                all_conditions.append("(" + " OR ".join(keyword_conditions) + ")")
+            if phrase_conditions:
+                all_conditions.append("(" + " OR ".join(phrase_conditions) + ")")
+            
+            if all_conditions:
+                where_clause += " AND (" + " OR ".join(all_conditions) + ")"
             
             params.append(top_k)
+            
+            # Build scoring query - count matches with phrase weighting
+            if phrases:
+                # Build phrase match conditions
+                phrase_match_expr = " + ".join([
+                    f"CASE WHEN dc.content ILIKE ${param_idx - len(keywords) - len(phrases) + i} THEN 2.0 ELSE 0.0 END"
+                    for i in range(len(phrases))
+                ])
+                keyword_match_expr = " + ".join([
+                    f"CASE WHEN dc.content ILIKE ${param_idx - len(keywords) - len(phrases) + len(phrases) + i} THEN 1.0 ELSE 0.0 END"
+                    for i in range(len(keywords))
+                ])
+                score_expr = f"({phrase_match_expr} + {keyword_match_expr})"
+            else:
+                # Just count keyword matches
+                score_expr = " + ".join([
+                    f"CASE WHEN dc.content ILIKE ${param_idx - len(keywords) + i} THEN 1.0 ELSE 0.0 END"
+                    for i in range(len(keywords))
+                ])
+            
             query = f"""
                 SELECT dc.id,
-                       COUNT(*)::FLOAT as score
+                       ({score_expr}) as score
                 FROM document_chunks dc
                 JOIN documents d ON dc.document_id = d.id
                 WHERE {where_clause}
                 GROUP BY dc.id
+                HAVING ({score_expr}) > 0
                 ORDER BY score DESC
                 LIMIT ${param_idx}
             """
+            
             rows = await conn.fetch(query, *params)
             
             # Normalize scores (simple approach)
@@ -282,7 +390,11 @@ class HybridRetriever:
             if rows:
                 max_score = max(float(row["score"]) for row in rows) or 1.0
                 for row in rows:
+                    # Normalize and boost scores (ensure minimum 0.2 for any match)
                     normalized_score = min(float(row["score"]) / max_score, 1.0)
+                    # Boost: if score > 0, ensure it's at least 0.2
+                    if normalized_score > 0:
+                        normalized_score = max(normalized_score, 0.2)
                     results.append((str(row["id"]), normalized_score))
             
             return results

@@ -33,13 +33,15 @@ export default function ChatInterface() {
     queryId?: string;
     citations?: Array<{ chunk_id: string; content: string; relevance_score: number; rank: number }>;
     groundednessScore?: number;
+    avgRelevanceScore?: number;
+    overallConfidence?: number;
   }>>([])
   const [expandedCitation, setExpandedCitation] = useState<string | null>(null)
 
-  const { data: history } = useQuery({
+  const { data: history, refetch: refetchHistory } = useQuery({
     queryKey: ['chat-history'],
     queryFn: async () => {
-      const response = await chatAPI.getHistory()
+      const response = await chatAPI.getHistory(5) // Get top 5 queries
       return response.data
     },
   })
@@ -60,9 +62,13 @@ export default function ChatInterface() {
           content: data.response_text, 
           queryId: data.query_id,
           citations: data.citations || [],
-          groundednessScore: data.groundedness_score
+          groundednessScore: data.groundedness_score,
+          avgRelevanceScore: data.avg_relevance_score,
+          overallConfidence: data.overall_confidence
         }
       ])
+      // Refresh history to show the new query in recent queries
+      refetchHistory()
     },
   })
 
@@ -148,6 +154,34 @@ export default function ChatInterface() {
               </button>
             </div>
           )}
+          
+          {/* Recent Queries - Top 5 */}
+          {history && history.length > 0 && (
+            <div className="pt-2 border-t border-gray-200">
+              <p className="text-xs font-medium text-gray-500 mb-2">Recent Queries:</p>
+              <div className="flex flex-wrap gap-2">
+                {history.slice(0, 5).map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => {
+                      const queryText = item.query_text
+                      setQuery(queryText)
+                      // Add user message and submit
+                      setMessages(prev => [...prev, { type: 'user', content: queryText }])
+                      mutation.mutate(queryText)
+                    }}
+                    className="px-3 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg border border-gray-300 hover:border-gray-400 transition-colors truncate max-w-xs"
+                    title={item.query_text}
+                    disabled={mutation.isPending}
+                  >
+                    {item.query_text.length > 40 
+                      ? `${item.query_text.substring(0, 40)}...` 
+                      : item.query_text}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </form>
       
@@ -170,43 +204,97 @@ export default function ChatInterface() {
                   : 'bg-white border border-gray-200'
               }`}
             >
-              <p className="whitespace-pre-wrap">{msg.content}</p>
-              
-              {/* Groundedness warning */}
-              {msg.type === 'assistant' && msg.groundednessScore !== undefined && msg.groundednessScore < 0.5 && (
-                <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded text-xs">
-                  <p className="text-yellow-800 font-medium">
-                    ⚠️ Low confidence: This response may not be fully supported by the source documents.
-                  </p>
+              {/* Confidence Score Badge - Always visible for assistant messages */}
+              {msg.type === 'assistant' && msg.overallConfidence !== undefined && (
+                <div className="mb-3 pb-3 border-b border-gray-200">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {/* Overall Confidence Score */}
+                    <div className={`px-3 py-1.5 rounded-lg font-semibold text-sm flex items-center gap-2 ${
+                      msg.overallConfidence >= 0.7 
+                        ? 'bg-green-100 text-green-800 border border-green-300' 
+                        : msg.overallConfidence >= 0.5
+                        ? 'bg-yellow-100 text-yellow-800 border border-yellow-300'
+                        : 'bg-red-100 text-red-800 border border-red-300'
+                    }`}>
+                      <span className="text-base">
+                        {msg.overallConfidence >= 0.7 ? '✓' : msg.overallConfidence >= 0.5 ? '⚠' : '✗'}
+                      </span>
+                      <span>Confidence: {(msg.overallConfidence * 100).toFixed(0)}%</span>
+                    </div>
+                    
+                    {/* Average Relevance Score */}
+                    {msg.avgRelevanceScore !== undefined && (
+                      <div className="px-3 py-1.5 rounded-lg font-medium text-xs bg-blue-50 text-blue-700 border border-blue-200">
+                        Avg Relevance: {(msg.avgRelevanceScore * 100).toFixed(0)}%
+                      </div>
+                    )}
+                    
+                    {/* Groundedness Score */}
+                    {msg.groundednessScore !== undefined && (
+                      <div className="px-3 py-1.5 rounded-lg font-medium text-xs bg-gray-50 text-gray-700 border border-gray-200">
+                        Groundedness: {(msg.groundednessScore * 100).toFixed(0)}%
+                      </div>
+                    )}
+                  </div>
+                  
+                  {/* Warning for low confidence */}
+                  {msg.overallConfidence < 0.5 && (
+                    <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded text-xs">
+                      <p className="text-yellow-800 font-medium">
+                        ⚠️ Low confidence: This response may not be fully supported by the source documents.
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
               
+              <p className="whitespace-pre-wrap">{msg.content}</p>
+              
               {/* Citations */}
               {msg.type === 'assistant' && msg.citations && msg.citations.length > 0 && (
-                <div className="mt-3 space-y-2">
-                  <p className="text-xs font-medium text-gray-500">Sources:</p>
-                  {msg.citations.map((citation, idx) => (
-                    <div key={citation.chunk_id} className="text-xs">
-                      <button
-                        onClick={() => setExpandedCitation(
-                          expandedCitation === citation.chunk_id ? null : citation.chunk_id
-                        )}
-                        className="text-blue-600 hover:text-blue-800 underline"
-                      >
-                        [{citation.rank}] {citation.content.substring(0, 60)}...
-                        {expandedCitation === citation.chunk_id ? ' (hide)' : ' (show)'}
-                      </button>
-                      {expandedCitation === citation.chunk_id && (
-                        <div className="mt-2 p-2 bg-gray-50 rounded text-xs text-gray-700 border-l-2 border-blue-500">
-                          <p className="font-medium mb-1">Source {citation.rank}:</p>
-                          <p className="whitespace-pre-wrap">{citation.content}</p>
-                          <p className="mt-1 text-gray-500">
-                            Relevance: {(citation.relevance_score * 100).toFixed(1)}%
-                          </p>
+                <div className="mt-4 space-y-2 border-t border-gray-200 pt-3">
+                  <p className="text-sm font-semibold text-gray-700 mb-2">📚 Sources ({msg.citations.length}):</p>
+                  {msg.citations.map((citation, idx) => {
+                    const relevancePercent = citation.relevance_score * 100
+                    const relevanceColor = relevancePercent >= 70 
+                      ? 'bg-green-100 text-green-800 border-green-300' 
+                      : relevancePercent >= 50
+                      ? 'bg-yellow-100 text-yellow-800 border-yellow-300'
+                      : 'bg-red-100 text-red-800 border-red-300'
+                    
+                    return (
+                      <div key={citation.chunk_id} className="text-sm border border-gray-200 rounded-lg p-2 hover:bg-gray-50 transition-colors">
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <button
+                            onClick={() => setExpandedCitation(
+                              expandedCitation === citation.chunk_id ? null : citation.chunk_id
+                            )}
+                            className="text-blue-600 hover:text-blue-800 font-medium text-left flex-1"
+                          >
+                            <span className="font-semibold">[{citation.rank}]</span> {citation.content.substring(0, 80)}...
+                            <span className="text-xs text-gray-500 ml-2">
+                              {expandedCitation === citation.chunk_id ? '(hide)' : '(show more)'}
+                            </span>
+                          </button>
+                          <div className={`px-2 py-1 rounded font-semibold text-xs border ${relevanceColor} whitespace-nowrap`}>
+                            {relevancePercent.toFixed(0)}% match
+                          </div>
                         </div>
-                      )}
-                    </div>
-                  ))}
+                        {expandedCitation === citation.chunk_id && (
+                          <div className="mt-2 p-3 bg-gray-50 rounded text-sm text-gray-700 border-l-4 border-blue-500">
+                            <p className="font-semibold mb-2 text-gray-900">Source {citation.rank} - Full Content:</p>
+                            <p className="whitespace-pre-wrap mb-2">{citation.content}</p>
+                            <div className="flex items-center gap-2 text-xs">
+                              <span className="font-medium text-gray-600">Relevance Score:</span>
+                              <span className={`px-2 py-1 rounded font-semibold border ${relevanceColor}`}>
+                                {(citation.relevance_score * 100).toFixed(1)}%
+                              </span>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
               )}
               

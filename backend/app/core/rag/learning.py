@@ -25,26 +25,30 @@ class LearningService:
     async def expand_query(
         self,
         query_text: str,
-        max_expansions: int = 3
+        max_expansions: int = 2  # Reduced from 3 to be more conservative
     ) -> str:
         """
         Expand query with related terms learned from successful queries.
         Finds similar queries that received positive feedback and extracts
         additional relevant terms.
         
+        NOTE: Query expansion is conservative to avoid adding noise.
+        Only adds terms that appear frequently in highly-rated similar queries.
+        
         Args:
             query_text: Original query text
-            max_expansions: Maximum number of terms to add
+            max_expansions: Maximum number of terms to add (reduced for accuracy)
             
         Returns:
-            Expanded query text
+            Expanded query text (or original if no good expansions found)
         """
         # Extract keywords from current query
-        query_words = set(re.findall(r'\b[a-z0-9]+\b', query_text.lower()))
+        query_words = set(re.findall(r'\b[a-z0-9]{3,}\b', query_text.lower()))
         
         # Find similar successful queries (positive feedback)
         async with self.db.acquire() as conn:
             # Get queries with positive feedback that are similar
+            # Only use queries with multiple positive feedbacks for reliability
             rows = await conn.fetch("""
                 SELECT q.query_text, COUNT(*) as positive_count
                 FROM queries q
@@ -52,27 +56,33 @@ class LearningService:
                 WHERE r.feedback = 1
                   AND q.query_text != $1
                 GROUP BY q.query_text
+                HAVING COUNT(*) >= 2  -- Only use queries with 2+ positive feedbacks
                 ORDER BY positive_count DESC
-                LIMIT 20
+                LIMIT 10  -- Reduced from 20
             """, query_text)
         
         # Extract terms from successful queries
         related_terms = Counter()
         for row in rows:
             successful_query = row["query_text"].lower()
-            terms = set(re.findall(r'\b[a-z0-9]{3,}\b', successful_query))
+            terms = set(re.findall(r'\b[a-z0-9]{4,}\b', successful_query))  # Only 4+ char terms
             # Find terms that appear in successful queries but not in current query
             new_terms = terms - query_words
             for term in new_terms:
+                # Only add if it appeared in multiple successful queries
                 related_terms[term] += row["positive_count"]
         
-        # Add top related terms to query
+        # Add top related terms to query (only if they appear in multiple queries)
         if related_terms:
-            top_terms = [term for term, _ in related_terms.most_common(max_expansions)]
-            expanded_query = query_text + " " + " ".join(top_terms)
-            return expanded_query
+            # Filter to terms that appear in at least 2 successful queries
+            filtered_terms = {term: count for term, count in related_terms.items() if count >= 2}
+            if filtered_terms:
+                top_terms = [term for term, _ in Counter(filtered_terms).most_common(max_expansions)]
+                if top_terms:
+                    expanded_query = query_text + " " + " ".join(top_terms)
+                    return expanded_query
         
-        return query_text
+        return query_text  # Return original if no good expansions
     
     async def get_document_priority_boost(
         self,

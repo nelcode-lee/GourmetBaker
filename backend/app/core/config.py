@@ -25,7 +25,8 @@ class Settings(BaseSettings):
     # RAG Parameters
     CHUNK_SIZE: int = 512
     CHUNK_OVERLAP: int = 50
-    TOP_K_RETRIEVAL: int = 5
+    TOP_K_RETRIEVAL: int = 8  # Increased from 5 for more context
+    MIN_RELEVANCE_SCORE: float = 0.15  # Lowered from 0.3 to catch more relevant chunks
     
     # Redis
     REDIS_URL: str = "redis://localhost:6379"

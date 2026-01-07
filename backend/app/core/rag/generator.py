@@ -53,12 +53,13 @@ class RAGGenerator:
         messages = self._build_messages(query, context, conversation_history)
         
         try:
-            # Call OpenAI API with lower temperature to reduce hallucination
+            # Call OpenAI API with very low temperature to maximize accuracy
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0.1,  # Lower temperature = more deterministic, less creative
-                max_tokens=1000
+                temperature=0.0,  # Set to 0 for maximum determinism and accuracy
+                max_tokens=1500,  # Increased to allow more detailed, accurate responses
+                top_p=0.9  # Nucleus sampling for more focused responses
             )
             
             response_text = response.choices[0].message.content
@@ -87,13 +88,29 @@ class RAGGenerator:
     
     def _format_context(self, chunks: List[Tuple[str, float, Dict]]) -> str:
         """Format retrieved chunks into context string"""
+        from app.core.config import get_settings
+        settings = get_settings()
+        
         context_parts = []
         for idx, (chunk_id, score, metadata) in enumerate(chunks, 1):
+            # Filter out low-relevance chunks
+            if score < settings.MIN_RELEVANCE_SCORE:
+                continue
+                
             content = metadata.get("content", "")
-            # Truncate very long chunks
-            if len(content) > 1000:
-                content = content[:1000] + "..."
-            context_parts.append(f"[{idx}] {content}")
+            # Increased truncation limit for better context (was 1000, now 2000)
+            if len(content) > 2000:
+                content = content[:2000] + "..."
+            
+            # Include relevance score and source info in context
+            filename = metadata.get("filename", "Unknown")
+            page_info = ""
+            if "page_number" in metadata:
+                page_info = f" (Page {metadata['page_number']})"
+            elif "headers" in metadata and metadata["headers"]:
+                page_info = f" (Section: {metadata['headers'][0]})"
+            
+            context_parts.append(f"[{idx}] Source: {filename}{page_info}\nRelevance: {score:.2f}\nContent: {content}")
         return "\n\n".join(context_parts)
     
     def _build_messages(
@@ -106,18 +123,21 @@ class RAGGenerator:
         messages = [
             {
                 "role": "system",
-                "content": """You are a technical documentation assistant. Your responses MUST be 100% accurate and based ONLY on the provided context.
+                "content": """You are a technical documentation assistant for Cranswick. Your responses MUST be 100% accurate and based EXCLUSIVELY on the provided context.
 
-CRITICAL RULES:
-1. ONLY use information explicitly stated in the provided context
-2. NEVER make up, infer, or assume information not in the context
-3. ALWAYS cite sources using [1], [2], etc. for every factual claim
-4. If the context doesn't contain enough information to answer, say: "The provided context does not contain sufficient information to answer this question. Please refer to the source documents."
-5. Do NOT combine information from multiple sources unless explicitly stated in the context
-6. Do NOT add general knowledge or information not in the provided context
-7. If you're uncertain, state that clearly
+CRITICAL RULES - FOLLOW STRICTLY:
+1. ONLY use information that is EXPLICITLY and DIRECTLY stated in the provided context
+2. NEVER make up, infer, assume, or extrapolate information not explicitly in the context
+3. NEVER use general knowledge or information from outside the provided context
+4. ALWAYS cite sources using [1], [2], etc. for EVERY factual claim you make
+5. If the context doesn't contain enough information to answer, you MUST say: "The provided context does not contain sufficient information to answer this question. Please refer to the source documents."
+6. Do NOT combine information from multiple sources unless the context explicitly shows they should be combined
+7. Do NOT paraphrase in ways that change meaning - quote or closely paraphrase the exact wording from context
+8. If you're uncertain about ANY detail, state that clearly: "The context does not provide clear information about [specific detail]"
+9. If the question asks about something not in the context, explicitly state it's not available
+10. Check the relevance scores - lower scores may be less reliable
 
-Your credibility depends on accuracy. When in doubt, say the information is not available in the provided context."""
+ACCURACY IS PARAMOUNT. When in doubt, say the information is not available in the provided context. It is better to say "not available" than to guess or make up information."""
             }
         ]
         
@@ -130,18 +150,22 @@ Your credibility depends on accuracy. When in doubt, say the information is not 
                     messages.append({"role": "assistant", "content": h["assistant"]})
         
         # Add current context and query with strict instructions
-        user_message = f"""Use ONLY the following context to answer the question. Do not use any information outside of this context.
+        user_message = f"""You are answering a question about technical standards documents. Use ONLY the following context. Do NOT use any information outside this context.
 
-CONTEXT:
+CONTEXT (with relevance scores):
 {context}
 
 QUESTION: {query}
 
-INSTRUCTIONS:
-- Answer ONLY using information from the context above
-- Cite every factual statement with [1], [2], etc.
-- If the answer is not in the context, explicitly state: "The provided context does not contain sufficient information to answer this question."
-- Do not make assumptions or add information not in the context"""
+STRICT INSTRUCTIONS:
+1. Answer ONLY using information EXPLICITLY stated in the context above
+2. Cite EVERY factual statement with [1], [2], etc. matching the source numbers
+3. If the answer is not in the context, you MUST say: "The provided context does not contain sufficient information to answer this question."
+4. Do NOT make assumptions, inferences, or add information not in the context
+5. Do NOT use general knowledge - only what's in the provided context
+6. If you see low relevance scores (<0.5), be extra cautious with that information
+7. Quote or closely paraphrase the exact wording from the context when possible
+8. If multiple sources conflict, mention this explicitly"""
         
         messages.append({"role": "user", "content": user_message})
         
@@ -188,7 +212,9 @@ INSTRUCTIONS:
             "not available",
             "not found",
             "not in the context",
-            "insufficient information"
+            "insufficient information",
+            "does not provide",
+            "cannot be determined from"
         ]
         
         if any(phrase.lower() in response_text.lower() for phrase in not_available_phrases):
@@ -200,26 +226,41 @@ INSTRUCTIONS:
         
         if not citations_found:
             # No citations found - potentially not grounded
-            return 0.3
+            # Check if response is very short (might be just saying "not available")
+            if len(response_text) < 50:
+                return 0.5  # Short response without citations
+            return 0.2  # Longer response without citations - low confidence
         
         # Check if cited chunks exist
         cited_indices = set(int(c) - 1 for c in citations_found if c.isdigit())
         valid_citations = sum(1 for idx in cited_indices if 0 <= idx < len(retrieved_chunks))
         
         if valid_citations == 0:
-            return 0.2  # Citations don't match available chunks
+            return 0.1  # Citations don't match available chunks - very low confidence
         
         # Calculate coverage: how many chunks are cited vs total chunks
         citation_coverage = valid_citations / len(retrieved_chunks) if retrieved_chunks else 0
+        
+        # Check average relevance of cited chunks
+        cited_scores = [retrieved_chunks[idx][1] for idx in cited_indices if 0 <= idx < len(retrieved_chunks)]
+        avg_relevance = sum(cited_scores) / len(cited_scores) if cited_scores else 0
+        
+        # Penalize if citing low-relevance chunks
+        if avg_relevance < 0.4:
+            citation_coverage *= 0.8
         
         # Check if response length suggests it might be adding information
         # If response is much longer than context, it might be hallucinating
         total_context_length = sum(len(chunk[2].get("content", "")) for chunk in retrieved_chunks)
         response_length = len(response_text)
         
-        if response_length > total_context_length * 1.5:
+        if response_length > total_context_length * 2.0:
             # Response is significantly longer than context - potential hallucination
-            citation_coverage *= 0.7
+            citation_coverage *= 0.6
+        
+        # Boost score if response explicitly references source documents
+        if any(phrase in response_text.lower() for phrase in ["according to", "as stated in", "the document", "source"]):
+            citation_coverage = min(citation_coverage * 1.1, 1.0)
         
         return min(citation_coverage, 1.0)
     

@@ -36,6 +36,8 @@ export interface QueryResponse {
   latency_ms: number
   created_at: string
   groundedness_score?: number  // 0-1 score indicating how well response is grounded in sources
+  avg_relevance_score?: number  // Average relevance score of all citations (0-1)
+  overall_confidence?: number  // Overall confidence score (0-1, weighted combination)
 }
 
 export interface Citation {

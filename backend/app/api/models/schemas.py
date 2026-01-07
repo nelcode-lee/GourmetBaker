@@ -81,6 +81,8 @@ class QueryResponse(BaseModel):
     latency_ms: int
     created_at: datetime
     groundedness_score: Optional[float] = None  # 0-1 score indicating how well response is grounded
+    avg_relevance_score: Optional[float] = None  # Average relevance score of all citations (0-1)
+    overall_confidence: Optional[float] = None  # Overall confidence score (0-1, weighted combination)
 
 
 class QueryHistoryItem(BaseModel):

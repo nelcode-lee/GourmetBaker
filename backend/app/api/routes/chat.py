@@ -40,22 +40,49 @@ async def send_query(
         # Generate query embedding
         query_embedding = embedding_service.generate_embedding(request.query)
         
-        # Retrieve relevant chunks (with learning enabled)
-        retriever = HybridRetriever(pool, use_feedback=True, use_learning=True)
+        # Retrieve relevant chunks (with learning enabled, but query expansion can be disabled if causing issues)
+        from app.core.config import get_settings
+        settings = get_settings()
+        
+        # Use learning but be more conservative with query expansion
+        # Temporarily disable learning if it's causing stalls - can re-enable after debugging
+        retriever = HybridRetriever(pool, use_feedback=True, use_learning=False)  # Disabled learning to prevent stalls
         retrieved_chunks = await retriever.retrieve(
             query_embedding=query_embedding,
             query_text=request.query,
-            top_k=5,
+            top_k=settings.TOP_K_RETRIEVAL,  # Use config value (now 8)
             document_ids=[str(doc_id) for doc_id in request.document_ids] if request.document_ids else None,
             core_area=request.core_area,
             factory=request.factory
         )
         
-        if not retrieved_chunks:
+        # Filter chunks by minimum relevance score, but be more lenient
+        filtered_chunks = [
+            chunk for chunk in retrieved_chunks 
+            if chunk[1] >= settings.MIN_RELEVANCE_SCORE  # chunk[1] is the relevance score
+        ]
+        
+        # If filtering removed all chunks, try with lower threshold or use top results anyway
+        if not filtered_chunks and retrieved_chunks:
+            # Try with even lower threshold (0.1)
+            filtered_chunks = [
+                chunk for chunk in retrieved_chunks 
+                if chunk[1] >= 0.1
+            ]
+            # If still nothing, just use top 3 results regardless of score
+            if not filtered_chunks:
+                filtered_chunks = retrieved_chunks[:3]
+                # Log that we're using low-relevance chunks
+                import logging
+                logging.warning(f"Using low-relevance chunks for query: {request.query}")
+        
+        if not filtered_chunks:
             raise HTTPException(
                 status_code=404,
-                detail="No relevant documents found. Please upload documents first."
+                detail="No relevant documents found. Please try rephrasing your question or check if the documents contain the information you're looking for."
             )
+        
+        retrieved_chunks = filtered_chunks
         
         # Generate response
         generator = RAGGenerator()
@@ -89,22 +116,64 @@ async def send_query(
             
             # Insert citations
             for idx, citation in enumerate(result["citations"]):
+                # Handle chunk_id - might be string or UUID
+                chunk_id = citation.get("chunk_id")
+                if isinstance(chunk_id, str):
+                    chunk_id = UUID(chunk_id)
+                elif not isinstance(chunk_id, UUID):
+                    chunk_id = UUID(str(chunk_id))
+                
                 await conn.execute("""
                     INSERT INTO query_citations (query_id, chunk_id, relevance_score, rank)
                     VALUES ($1, $2, $3, $4)
-                """, query_id, UUID(citation["chunk_id"]), citation["relevance_score"], idx + 1)
+                """, query_id, chunk_id, citation.get("relevance_score", 0.0), idx + 1)
         
         # Format citations for response
-        citation_responses = [
-            CitationResponse(
-                chunk_id=UUID(c["chunk_id"]),
-                content=c["content"],
-                relevance_score=c["relevance_score"],
-                rank=idx + 1,
-                metadata=c.get("metadata", {})
-            )
-            for idx, c in enumerate(result["citations"])
-        ]
+        citation_responses = []
+        citations = result.get("citations", [])
+        
+        for idx, c in enumerate(citations):
+            try:
+                # Handle chunk_id - might be string or UUID
+                chunk_id = c.get("chunk_id")
+                if chunk_id is None:
+                    continue  # Skip if no chunk_id
+                if isinstance(chunk_id, str):
+                    chunk_id = UUID(chunk_id)
+                elif not isinstance(chunk_id, UUID):
+                    chunk_id = UUID(str(chunk_id))
+                
+                citation_responses.append(
+                    CitationResponse(
+                        chunk_id=chunk_id,
+                        content=str(c.get("content", ""))[:500],  # Limit content length
+                        relevance_score=float(c.get("relevance_score", 0.0)),
+                        rank=idx + 1,
+                        metadata=c.get("metadata", {}) or {}
+                    )
+                )
+            except Exception as e:
+                # Skip invalid citations but log the error
+                import logging
+                logging.warning(f"Skipping invalid citation at index {idx}: {e}")
+                continue
+        
+        # Calculate average relevance score from citations
+        avg_relevance = 0.0
+        if citation_responses:
+            try:
+                avg_relevance = sum(c.relevance_score for c in citation_responses) / len(citation_responses)
+            except (ZeroDivisionError, TypeError):
+                avg_relevance = 0.0
+        
+        # Calculate overall confidence score (weighted combination)
+        # 60% groundedness + 40% average relevance
+        groundedness = result.get("groundedness_score")
+        if groundedness is None:
+            groundedness = 1.0  # Default to high if not calculated
+        
+        # Calculate overall confidence (weighted combination)
+        overall_confidence = (groundedness * 0.6) + (avg_relevance * 0.4)
         
         return QueryResponse(
             query_id=query_id,
@@ -114,12 +183,19 @@ async def send_query(
             tokens_used=result["tokens_used"],
             latency_ms=result["latency_ms"],
             created_at=created_at,
-            groundedness_score=result.get("groundedness_score", 1.0)
+            groundedness_score=groundedness,
+            avg_relevance_score=avg_relevance,
+            overall_confidence=overall_confidence
         )
         
     except HTTPException:
         raise
     except Exception as e:
+        # Log the full error for debugging
+        import logging
+        import traceback
+        error_trace = traceback.format_exc()
+        logging.error(f"Query processing failed: {str(e)}\n{error_trace}")
         raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
 
