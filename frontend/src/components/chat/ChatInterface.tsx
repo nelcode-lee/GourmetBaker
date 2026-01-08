@@ -37,6 +37,7 @@ export default function ChatInterface() {
     overallConfidence?: number;
   }>>([])
   const [expandedCitation, setExpandedCitation] = useState<string | null>(null)
+  const [feedbackMessages, setFeedbackMessages] = useState<Record<string, string>>({})
 
   const { data: history, refetch: refetchHistory } = useQuery({
     queryKey: ['chat-history'],
@@ -246,18 +247,20 @@ export default function ChatInterface() {
                 <div className="mb-3 pb-3 border-b border-gray-200">
                   <div className="flex items-center gap-3 flex-wrap">
                     {/* Overall Confidence Score */}
-                    <div className={`px-3 py-1.5 rounded-lg font-semibold text-sm flex items-center gap-2 ${
-                      msg.overallConfidence >= 0.7 
-                        ? 'bg-green-100 text-green-800 border border-green-300' 
-                        : msg.overallConfidence >= 0.5
-                        ? 'bg-yellow-100 text-yellow-800 border border-yellow-300'
-                        : 'bg-red-100 text-red-800 border border-red-300'
-                    }`}>
-                      <span className="text-base">
-                        {msg.overallConfidence >= 0.7 ? '✓' : msg.overallConfidence >= 0.5 ? '⚠' : '✗'}
-                      </span>
-                      <span>Confidence: {(msg.overallConfidence * 100).toFixed(0)}%</span>
-                    </div>
+                    {(() => {
+                      const confidenceLevel = msg.overallConfidence >= 0.65 
+                        ? { label: 'High', icon: '✓', color: 'bg-green-100 text-green-800 border-green-300' }
+                        : msg.overallConfidence >= 0.4
+                        ? { label: 'Medium', icon: '⚠', color: 'bg-yellow-100 text-yellow-800 border-yellow-300' }
+                        : { label: 'Low', icon: '✗', color: 'bg-red-100 text-red-800 border-red-300' }
+                      
+                      return (
+                        <div className={`px-3 py-1.5 rounded-lg font-semibold text-sm flex items-center gap-2 ${confidenceLevel.color}`}>
+                          <span className="text-base">{confidenceLevel.icon}</span>
+                          <span>Confidence: {confidenceLevel.label}</span>
+                        </div>
+                      )
+                    })()}
                     
                     {/* Average Relevance Score */}
                     {msg.avgRelevanceScore !== undefined && (
@@ -275,7 +278,7 @@ export default function ChatInterface() {
                   </div>
                   
                   {/* Warning for low confidence */}
-                  {msg.overallConfidence < 0.5 && (
+                  {msg.overallConfidence < 0.4 && (
                     <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded text-xs">
                       <p className="text-yellow-800 font-medium">
                         ⚠️ Low confidence: This response may not be fully supported by the source documents.
@@ -337,22 +340,51 @@ export default function ChatInterface() {
               
               {/* Feedback buttons */}
               {msg.type === 'assistant' && msg.queryId && (
-                <div className="mt-4 flex items-center gap-3 border-t border-gray-200 pt-3">
-                  <span className="text-xs text-gray-500 font-medium">Was this helpful?</span>
-                  <button
-                    onClick={() => chatAPI.submitFeedback(msg.queryId!, 1)}
-                    className="px-3 py-1.5 text-lg hover:bg-green-50 rounded-lg transition-colors border border-gray-200 hover:border-green-300"
-                    title="Thumbs up - This response was helpful"
-                  >
-                    👍
-                  </button>
-                  <button
-                    onClick={() => chatAPI.submitFeedback(msg.queryId!, -1)}
-                    className="px-3 py-1.5 text-lg hover:bg-red-50 rounded-lg transition-colors border border-gray-200 hover:border-red-300"
-                    title="Thumbs down - This response was not helpful"
-                  >
-                    👎
-                  </button>
+                <div className="mt-4 border-t border-gray-200 pt-3">
+                  {feedbackMessages[msg.queryId] ? (
+                    <div className="flex items-center gap-2 text-sm text-green-600 font-medium">
+                      <span>✓</span>
+                      <span>{feedbackMessages[msg.queryId]}</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs text-gray-500 font-medium">Was this helpful?</span>
+                      <button
+                        onClick={async () => {
+                          try {
+                            const response = await chatAPI.submitFeedback(msg.queryId!, 1)
+                            setFeedbackMessages(prev => ({
+                              ...prev,
+                              [msg.queryId!]: response.data.message || "Thank you for your feedback!"
+                            }))
+                          } catch (error) {
+                            console.error('Failed to submit feedback:', error)
+                          }
+                        }}
+                        className="px-3 py-1.5 text-lg hover:bg-green-50 rounded-lg transition-colors border border-gray-200 hover:border-green-300"
+                        title="Thumbs up - This response was helpful"
+                      >
+                        👍
+                      </button>
+                      <button
+                        onClick={async () => {
+                          try {
+                            const response = await chatAPI.submitFeedback(msg.queryId!, -1)
+                            setFeedbackMessages(prev => ({
+                              ...prev,
+                              [msg.queryId!]: response.data.message || "Thank you for your feedback!"
+                            }))
+                          } catch (error) {
+                            console.error('Failed to submit feedback:', error)
+                          }
+                        }}
+                        className="px-3 py-1.5 text-lg hover:bg-red-50 rounded-lg transition-colors border border-gray-200 hover:border-red-300"
+                        title="Thumbs down - This response was not helpful"
+                      >
+                        👎
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

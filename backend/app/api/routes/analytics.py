@@ -11,7 +11,8 @@ from app.api.models.schemas import (
     DocumentUsageStats,
     ChunkTagStats,
     KeyTermStats,
-    DocumentQueryStats
+    DocumentQueryStats,
+    QualityMetrics
 )
 
 router = APIRouter()
@@ -277,4 +278,187 @@ async def get_document_usage_stats(
             ))
     
     return stats
+
+
+@router.get("/quality-metrics", response_model=QualityMetrics)
+async def get_quality_metrics(
+    pool: asyncpg.Pool = Depends(get_db_pool)
+):
+    """
+    Get quality metrics for donut charts
+    Includes feedback distribution, confidence scores, relevance scores, etc.
+    """
+    async with pool.acquire() as conn:
+        # Feedback distribution
+        feedback_rows = await conn.fetch("""
+            SELECT 
+                CASE 
+                    WHEN feedback = 1 THEN 'positive'
+                    WHEN feedback = -1 THEN 'negative'
+                    ELSE 'neutral'
+                END as feedback_type,
+                COUNT(*) as count
+            FROM responses
+            WHERE feedback IS NOT NULL
+            GROUP BY feedback_type
+        """)
+        feedback_distribution = {row["feedback_type"]: row["count"] for row in feedback_rows}
+        # Ensure all keys exist
+        for key in ['positive', 'negative', 'neutral']:
+            if key not in feedback_distribution:
+                feedback_distribution[key] = 0
+        
+        # Confidence score distribution - use a more efficient query
+        # Calculate from query_citations grouped by query
+        confidence_rows = await conn.fetch("""
+            WITH query_avg_scores AS (
+                SELECT 
+                    qc.query_id,
+                    AVG(qc.relevance_score) as avg_score
+                FROM query_citations qc
+                GROUP BY qc.query_id
+            )
+            SELECT 
+                CASE 
+                    WHEN avg_score >= 0.7 THEN 'high'
+                    WHEN avg_score >= 0.4 THEN 'medium'
+                    ELSE 'low'
+                END as confidence_level,
+                COUNT(*) as count
+            FROM query_avg_scores
+            GROUP BY confidence_level
+        """)
+        confidence_distribution = {'high': 0, 'medium': 0, 'low': 0}
+        for row in confidence_rows:
+            level = row["confidence_level"]
+            if level in confidence_distribution:
+                confidence_distribution[level] += row["count"]
+        
+        # Relevance score distribution - optimized query
+        relevance_rows = await conn.fetch("""
+            SELECT 
+                CASE 
+                    WHEN relevance_score >= 0.7 THEN 'high'
+                    WHEN relevance_score >= 0.4 THEN 'medium'
+                    ELSE 'low'
+                END as relevance_level,
+                COUNT(*) as count
+            FROM query_citations
+            WHERE relevance_score IS NOT NULL
+            GROUP BY 
+                CASE 
+                    WHEN relevance_score >= 0.7 THEN 'high'
+                    WHEN relevance_score >= 0.4 THEN 'medium'
+                    ELSE 'low'
+                END
+        """)
+        relevance_distribution = {'high': 0, 'medium': 0, 'low': 0}
+        for row in relevance_rows:
+            level = row["relevance_level"]
+            if level in relevance_distribution:
+                relevance_distribution[level] += row["count"]
+        
+        # Document status distribution
+        status_rows = await conn.fetch("""
+            SELECT status, COUNT(*) as count
+            FROM documents
+            GROUP BY status
+        """)
+        document_status_distribution = {row["status"]: row["count"] for row in status_rows}
+        
+        # Average scores - use more efficient query
+        avg_confidence = await conn.fetchval("""
+            WITH query_avg_scores AS (
+                SELECT AVG(qc.relevance_score) as avg_score
+                FROM query_citations qc
+                GROUP BY qc.query_id
+            )
+            SELECT AVG(
+                CASE 
+                    WHEN avg_score >= 0.7 THEN 0.85
+                    WHEN avg_score >= 0.4 THEN 0.55
+                    ELSE 0.25
+                END
+            )::FLOAT
+            FROM query_avg_scores
+        """) or 0.0
+        
+        avg_relevance = await conn.fetchval("""
+            SELECT AVG(relevance_score)::FLOAT
+            FROM query_citations
+        """) or 0.0
+        
+        # For groundedness, we'd need to store it in responses table
+        # For now, use a calculated value based on citation coverage
+        avg_groundedness = await conn.fetchval("""
+            SELECT AVG(
+                CASE 
+                    WHEN citation_count >= 3 THEN 0.9
+                    WHEN citation_count >= 2 THEN 0.7
+                    WHEN citation_count >= 1 THEN 0.5
+                    ELSE 0.3
+                END
+            )::FLOAT
+            FROM (
+                SELECT qc.query_id, COUNT(*) as citation_count
+                FROM query_citations qc
+                GROUP BY qc.query_id
+            ) subq
+        """) or 0.0
+        
+        total_with_feedback = await conn.fetchval("""
+            SELECT COUNT(*) FROM responses WHERE feedback IS NOT NULL
+        """) or 0
+        
+        total_with_confidence = await conn.fetchval("""
+            SELECT COUNT(DISTINCT query_id) FROM query_citations
+        """) or 0
+        
+        # Calculate Training Quality Score (0-100)
+        # Composite metric combining multiple indicators of agent performance
+        # Components:
+        # 1. Positive feedback ratio (40% weight) - how often users are satisfied
+        # 2. Average confidence score (30% weight) - how confident the agent is
+        # 3. Average relevance score (20% weight) - how relevant retrieved chunks are
+        # 4. Query success rate (10% weight) - queries with positive feedback / total queries
+        
+        # 1. Positive feedback ratio
+        total_queries = await conn.fetchval("SELECT COUNT(*) FROM queries") or 1
+        positive_feedback_count = feedback_distribution.get('positive', 0)
+        negative_feedback_count = feedback_distribution.get('negative', 0)
+        total_feedback_count = positive_feedback_count + negative_feedback_count
+        positive_feedback_ratio = (positive_feedback_count / total_feedback_count * 100) if total_feedback_count > 0 else 0.0
+        
+        # 2. Average confidence score (normalize to 0-100)
+        confidence_score_normalized = avg_confidence * 100 if avg_confidence > 0 else 0.0
+        
+        # 3. Average relevance score (normalize to 0-100)
+        relevance_score_normalized = avg_relevance * 100 if avg_relevance > 0 else 0.0
+        
+        # 4. Query success rate (queries with positive feedback / total queries)
+        query_success_rate = (positive_feedback_count / total_queries * 100) if total_queries > 0 else 0.0
+        
+        # Calculate weighted composite score
+        training_quality_score = (
+            positive_feedback_ratio * 0.40 +      # 40% weight
+            confidence_score_normalized * 0.30 +    # 30% weight
+            relevance_score_normalized * 0.20 +     # 20% weight
+            query_success_rate * 0.10              # 10% weight
+        )
+        
+        # Cap at 100 and ensure minimum of 0
+        training_quality_score = max(0.0, min(100.0, training_quality_score))
+    
+    return QualityMetrics(
+        feedback_distribution=feedback_distribution,
+        confidence_distribution=confidence_distribution,
+        relevance_distribution=relevance_distribution,
+        document_status_distribution=document_status_distribution,
+        avg_confidence_score=avg_confidence,
+        avg_relevance_score=avg_relevance,
+        avg_groundedness_score=avg_groundedness,
+        total_with_feedback=total_with_feedback,
+        total_with_confidence=total_with_confidence,
+        training_quality_score=training_quality_score
+    )
 

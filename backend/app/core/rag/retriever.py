@@ -84,12 +84,14 @@ class HybridRetriever:
                 logging.warning(f"Adaptive weights failed, using defaults: {e}")
                 # Keep default weights
         
-        # Get results from both searches
+        # Get results from both searches - increased multiplier for better coverage
+        # Fetch more candidates to ensure we don't miss relevant chunks
+        candidate_multiplier = 2.5  # Increased from 1.5 for better recall
         vector_results = await self._vector_search(
-            query_embedding, top_k * 2, document_ids, core_area, factory
+            query_embedding, int(top_k * candidate_multiplier), document_ids, core_area, factory
         )
         keyword_results = await self._keyword_search(
-            expanded_query, top_k * 2, document_ids, core_area, factory
+            expanded_query, int(top_k * candidate_multiplier), document_ids, core_area, factory
         )
         
         # Combine scores
@@ -156,8 +158,10 @@ class HybridRetriever:
                 )
             
             # Ensure minimum score if either search found something
-            if vector_score > 0 or keyword_score > 0:
-                combined_score = max(combined_score, 0.15)  # Minimum 0.15 if any match
+            # But don't artificially inflate low scores - let them be low
+            # Only set minimum if we have a reasonable match
+            if (vector_score > 0.3 or keyword_score > 0.3):
+                combined_score = max(combined_score, 0.2)  # Minimum 0.2 for reasonable matches
             
             final_results.append((chunk_id, combined_score))
         
@@ -183,39 +187,55 @@ class HybridRetriever:
         final_results.sort(key=lambda x: x[1], reverse=True)
         top_results = final_results[:top_k]
         
-        # Fetch full chunk data with metadata
+        # Fetch full chunk data with metadata - optimized batch query
+        if not top_results:
+            return []
+        
         results_with_metadata = []
         async with self.db.acquire() as conn:
-            for chunk_id, score in top_results:
-                row = await conn.fetchrow("""
-                    SELECT dc.id, dc.content, dc.metadata, dc.chunk_index,
-                           d.id as document_id, d.filename
-                    FROM document_chunks dc
-                    JOIN documents d ON dc.document_id = d.id
-                    WHERE dc.id = $1 AND d.status = 'ready'
-                """, UUID(chunk_id))
+            # Batch fetch all chunks in a single query for better performance
+            chunk_ids = [UUID(chunk_id) for chunk_id, _ in top_results]
+            rows = await conn.fetch("""
+                SELECT dc.id, dc.content, dc.metadata, dc.chunk_index,
+                       d.id as document_id, d.filename
+                FROM document_chunks dc
+                JOIN documents d ON dc.document_id = d.id
+                WHERE dc.id = ANY($1::uuid[]) AND d.status = 'ready'
+            """, chunk_ids)
+            
+            # Create a lookup map for scores
+            score_map = {chunk_id: score for chunk_id, score in top_results}
+            
+            # Parse and build results
+            import json
+            for row in rows:
+                chunk_id = str(row["id"])
+                if chunk_id not in score_map:
+                    continue
                 
-                if row:
-                    # Parse metadata if it's a JSON string
-                    import json
-                    row_metadata = row["metadata"]
-                    if isinstance(row_metadata, str):
-                        try:
-                            row_metadata = json.loads(row_metadata)
-                        except:
-                            row_metadata = {}
-                    elif row_metadata is None:
+                score = score_map[chunk_id]
+                
+                # Parse metadata if it's a JSON string
+                row_metadata = row["metadata"]
+                if isinstance(row_metadata, str):
+                    try:
+                        row_metadata = json.loads(row_metadata)
+                    except:
                         row_metadata = {}
-                    
-                    metadata = {
-                        "content": row["content"],
-                        "chunk_index": row["chunk_index"],
-                        "document_id": str(row["document_id"]),
-                        "filename": row["filename"],
-                        **row_metadata
-                    }
-                    results_with_metadata.append((chunk_id, score, metadata))
+                elif row_metadata is None:
+                    row_metadata = {}
+                
+                metadata = {
+                    "content": row["content"],
+                    "chunk_index": row["chunk_index"],
+                    "document_id": str(row["document_id"]),
+                    "filename": row["filename"],
+                    **row_metadata
+                }
+                results_with_metadata.append((chunk_id, score, metadata))
         
+        # Sort by score to maintain order (in case batch query changed order)
+        results_with_metadata.sort(key=lambda x: x[1], reverse=True)
         return results_with_metadata
     
     async def _vector_search(
@@ -278,25 +298,57 @@ class HybridRetriever:
         factory: Optional[str] = None
     ) -> List[Tuple[str, float]]:
         """
-        Keyword search using PostgreSQL full-text search
-        Enhanced to handle multi-word phrases and improve scoring
+        Keyword search using PostgreSQL full-text search with fuzzy matching
+        Enhanced to handle typos, spelling mistakes, and terminology variations
         """
         import re
+        from app.core.rag.query_normalization import QueryNormalizer
         
-        # Extract keywords from query - keep important phrases together
-        # Remove common stop words but keep important terms
-        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'what', 'are', 'were', 'was'}
-        words = re.findall(r'\b[a-z0-9]+\b', query_text.lower())
+        # Normalize query to fix typos
+        normalized_query = QueryNormalizer.normalize_query(query_text)
+        
+        # Extract keywords from both original and normalized query
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'what', 'are', 'were', 'was', 'should', 'include'}
+        
+        # Get keywords from normalized query
+        words = re.findall(r'\b[a-z0-9]+\b', normalized_query.lower())
         keywords = [w for w in words if w not in stop_words and len(w) > 2]
         
-        # Also try to match common phrases (2-3 word combinations)
+        # Also get fuzzy keyword variations for better matching
+        fuzzy_keywords = QueryNormalizer.generate_fuzzy_keywords(query_text)
+        fuzzy_keywords = [w for w in fuzzy_keywords if w not in stop_words and len(w) > 2]
+        
+        # Combine and deduplicate
+        all_keywords = list(set(keywords + fuzzy_keywords))
+        
+        # Extract important phrases - improved to capture key concepts
         phrases = []
         if len(words) >= 2:
-            # Extract 2-word phrases
+            # Extract 2-word phrases (even if one word is a stop word, if it's part of a technical term)
             for i in range(len(words) - 1):
-                phrase = f"{words[i]} {words[i+1]}"
-                if all(w not in stop_words for w in words[i:i+2]):
-                    phrases.append(phrase)
+                # Don't skip phrases with "and" if it's part of a technical term like "reports and certificates"
+                if words[i] not in stop_words or (i > 0 and words[i-1] not in stop_words):
+                    phrase = f"{words[i]} {words[i+1]}"
+                    # Include phrase if at least one word is not a stop word
+                    if words[i] not in stop_words or words[i+1] not in stop_words:
+                        phrases.append(phrase)
+            
+            # Also extract 3-word phrases for important technical terms
+            if len(words) >= 3:
+                for i in range(len(words) - 2):
+                    # Check if this looks like a technical phrase (e.g., "reports and certificates")
+                    if (words[i] not in stop_words or words[i+2] not in stop_words):
+                        phrase = f"{words[i]} {words[i+1]} {words[i+2]}"
+                        phrases.append(phrase)
+        
+        # Remove duplicate phrases while preserving order
+        seen_phrases = set()
+        unique_phrases = []
+        for phrase in phrases:
+            if phrase not in seen_phrases:
+                seen_phrases.add(phrase)
+                unique_phrases.append(phrase)
+        phrases = unique_phrases
         
         if not keywords and not phrases:
             return []
@@ -326,19 +378,36 @@ class HybridRetriever:
                 params.append(factory)
                 param_idx += 1
             
-            # Keyword search conditions - phrases get higher weight
+            # Keyword search conditions - use fuzzy matching for typos
             keyword_conditions = []
-            for keyword in keywords:
+            for keyword in all_keywords:
+                # Use ILIKE for exact/substring matches (handles most cases)
                 keyword_conditions.append(f"dc.content ILIKE ${param_idx}")
                 params.append(f"%{keyword}%")
                 param_idx += 1
+                
+                # For longer words, also try character-level fuzzy matching
+                # This helps match typos (e.g., "guidlines" -> "guidelines")
+                if len(keyword) >= 4:
+                    # Try variations with common typos (character swaps, deletions)
+                    # Use multiple ILIKE patterns to catch variations
+                    # Pattern 1: Missing one character (e.g., "guidlines" matches "guidelines")
+                    # Pattern 2: Extra character (e.g., "guuidelines" matches "guidelines")
+                    # Pattern 3: Character swap (e.g., "guidleines" matches "guidelines")
+                    # We'll use a simpler approach: just use the keyword variations we already generated
+                    pass  # Variations already included in all_keywords
             
             # Phrase conditions (exact phrase matching gets higher score)
+            # Prioritize longer phrases first (3-word > 2-word)
+            phrases_to_use = []
             phrase_conditions = []
-            for phrase in phrases[:3]:  # Limit to top 3 phrases
-                phrase_conditions.append(f"dc.content ILIKE ${param_idx}")
-                params.append(f"%{phrase}%")
-                param_idx += 1
+            if phrases:
+                phrases_sorted = sorted(phrases, key=lambda x: (len(x.split()), len(x)), reverse=True)
+                phrases_to_use = phrases_sorted[:5]  # Increased from 3 to 5 for better coverage
+                for phrase in phrases_to_use:
+                    phrase_conditions.append(f"dc.content ILIKE ${param_idx}")
+                    params.append(f"%{phrase}%")
+                    param_idx += 1
             
             where_clause = " AND ".join(base_conditions)
             all_conditions = []
@@ -353,14 +422,17 @@ class HybridRetriever:
             params.append(top_k)
             
             # Build scoring query - count matches with phrase weighting
-            if phrases:
-                # Build phrase match conditions
-                phrase_match_expr = " + ".join([
-                    f"CASE WHEN dc.content ILIKE ${param_idx - len(keywords) - len(phrases) + i} THEN 2.0 ELSE 0.0 END"
-                    for i in range(len(phrases))
-                ])
+            # Longer phrases get higher weight (3-word > 2-word > single keyword)
+            if phrases_to_use and phrase_conditions:
+                # Build phrase match conditions with variable weights based on phrase length
+                phrase_weights = []
+                for i, phrase in enumerate(phrases_to_use):
+                    weight = 3.0 if len(phrase.split()) >= 3 else 2.0  # 3-word phrases get 3.0, 2-word get 2.0
+                    phrase_weights.append(f"CASE WHEN dc.content ILIKE ${param_idx - len(keywords) - len(phrases_to_use) + i} THEN {weight} ELSE 0.0 END")
+                
+                phrase_match_expr = " + ".join(phrase_weights)
                 keyword_match_expr = " + ".join([
-                    f"CASE WHEN dc.content ILIKE ${param_idx - len(keywords) - len(phrases) + len(phrases) + i} THEN 1.0 ELSE 0.0 END"
+                    f"CASE WHEN dc.content ILIKE ${param_idx - len(keywords) - len(phrases_to_use) + len(phrases_to_use) + i} THEN 1.0 ELSE 0.0 END"
                     for i in range(len(keywords))
                 ])
                 score_expr = f"({phrase_match_expr} + {keyword_match_expr})"

@@ -149,3 +149,16 @@ class KeyTermStats(BaseModel):
     avg_feedback: Optional[float] = None
     unique_queries: int  # Number of distinct queries containing this term
 
+
+class QualityMetrics(BaseModel):
+    feedback_distribution: Dict[str, int]  # positive, negative, neutral
+    confidence_distribution: Dict[str, int]  # high, medium, low
+    relevance_distribution: Dict[str, int]  # high, medium, low
+    document_status_distribution: Dict[str, int]  # ready, processing, failed
+    avg_confidence_score: float
+    avg_relevance_score: float
+    avg_groundedness_score: float
+    total_with_feedback: int
+    total_with_confidence: int
+    training_quality_score: float  # Composite score 0-100 indicating how well trained the agent is
+

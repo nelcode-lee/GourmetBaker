@@ -107,3 +107,16 @@ export interface KeyTermStats {
   unique_queries: number
 }
 
+export interface QualityMetrics {
+  feedback_distribution: Record<string, number>
+  confidence_distribution: Record<string, number>
+  relevance_distribution: Record<string, number>
+  document_status_distribution: Record<string, number>
+  avg_confidence_score: number
+  avg_relevance_score: number
+  avg_groundedness_score: number
+  total_with_feedback: number
+  total_with_confidence: number
+  training_quality_score: number  // Composite score 0-100 indicating how well trained the agent is
+}
+

@@ -71,5 +71,6 @@ export const analyticsAPI = {
   getQueriesByChunkTags: () => api.get('/analytics/queries/by-chunk-tags'),
   getQueriesByDocuments: () => api.get('/analytics/queries/by-documents'),
   getQueriesByKeyTerms: () => api.get('/analytics/queries/by-key-terms'),
+  getQualityMetrics: () => api.get('/analytics/quality-metrics'),
 }
 

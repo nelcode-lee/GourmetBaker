@@ -44,62 +44,184 @@ async def send_query(
     async def process_query():
         """Inner function to process the query with timeout protection"""
         try:
-            # Generate query embedding
+            # Check cache first
+            from app.core.config import get_settings
+            from app.core.cache import get_cache_service
+            settings = get_settings()
+            cache_service = get_cache_service()
+            
+            # Normalize query for cache lookup (typos should get same cached result)
+            from app.core.rag.query_normalization import QueryNormalizer
+            normalized_query_for_cache = QueryNormalizer.normalize_query(request.query)
+            
+            if settings.CACHE_ENABLED:
+                # Try cache with normalized query first (handles typos)
+                cached_response = await cache_service.get(
+                    query=normalized_query_for_cache,
+                    document_ids=[str(doc_id) for doc_id in request.document_ids] if request.document_ids else None,
+                    core_area=request.core_area,
+                    factory=request.factory
+                )
+                
+                # If not found, try original query (for backward compatibility)
+                if not cached_response:
+                    cached_response = await cache_service.get(
+                        query=request.query,
+                        document_ids=[str(doc_id) for doc_id in request.document_ids] if request.document_ids else None,
+                        core_area=request.core_area,
+                        factory=request.factory
+                    )
+                
+                if cached_response:
+                    # Get cached confidence score
+                    cached_confidence = cached_response.get("overall_confidence")
+                    logger.info(f"Returning cached response with confidence: {cached_confidence:.2f}%")
+                    
+                    # Convert cached data back to QueryResponse
+                    from app.api.models.schemas import CitationResponse
+                    citation_responses = [
+                        CitationResponse(**c) for c in cached_response.get("citations", [])
+                    ]
+                    from datetime import datetime
+                    created_at = None
+                    if cached_response.get("created_at"):
+                        try:
+                            created_at = datetime.fromisoformat(cached_response["created_at"])
+                        except:
+                            created_at = datetime.now()
+                    
+                    # Ensure we use the exact cached confidence score
+                    overall_confidence = float(cached_confidence) if cached_confidence is not None else 0.0
+                    logger.info(f"Using cached confidence: {overall_confidence:.2f} (raw: {cached_confidence})")
+                    
+                    return QueryResponse(
+                        query_id=UUID(cached_response.get("query_id")) if cached_response.get("query_id") else None,
+                        response_text=cached_response.get("response_text"),
+                        citations=citation_responses,
+                        model=cached_response.get("model"),
+                        tokens_used=cached_response.get("tokens_used", 0),
+                        latency_ms=cached_response.get("latency_ms", 0),
+                        created_at=created_at or datetime.now(),
+                        groundedness_score=cached_response.get("groundedness_score"),
+                        avg_relevance_score=cached_response.get("avg_relevance_score"),
+                        overall_confidence=overall_confidence
+                    )
+            
+            # Use normalized query from cache lookup (already computed above)
+            normalized_query = normalized_query_for_cache
+            if normalized_query != request.query:
+                logger.info(f"Query normalized: '{request.query}' -> '{normalized_query}'")
+            
+            # Generate query embedding using normalized query (more robust)
             logger.info("Generating query embedding...")
-            query_embedding = embedding_service.generate_embedding(request.query)
+            primary_embedding = embedding_service.generate_embedding(normalized_query)
             logger.info("Query embedding generated")
             
-            # Retrieve relevant chunks (with learning enabled, but query expansion can be disabled if causing issues)
-            from app.core.config import get_settings
-            settings = get_settings()
-            
+            # Retrieve relevant chunks (settings already loaded above)
             logger.info("Initializing retriever...")
-            # Use learning but be more conservative with query expansion
-            # Temporarily disable learning if it's causing stalls - can re-enable after debugging
-            retriever = HybridRetriever(pool, use_feedback=True, use_learning=False)  # Disabled learning to prevent stalls
+            retriever = HybridRetriever(pool, use_feedback=True, use_learning=False)
             logger.info("Retrieving chunks...")
+            
+            # Primary retrieval - use normalized query for better matching
             retrieved_chunks = await retriever.retrieve(
-                query_embedding=query_embedding,
-                query_text=request.query,
-                top_k=settings.TOP_K_RETRIEVAL,  # Use config value (now 8)
+                query_embedding=primary_embedding,
+                query_text=normalized_query,  # Use normalized query for better keyword matching
+                top_k=settings.TOP_K_RETRIEVAL,
                 document_ids=[str(doc_id) for doc_id in request.document_ids] if request.document_ids else None,
                 core_area=request.core_area,
                 factory=request.factory
             )
+            
             logger.info(f"Retrieved {len(retrieved_chunks)} chunks")
             
-            # Filter chunks by minimum relevance score, but be more lenient
-            filtered_chunks = [
-                chunk for chunk in retrieved_chunks 
-                if chunk[1] >= settings.MIN_RELEVANCE_SCORE  # chunk[1] is the relevance score
-            ]
+            # Always try query variations if enabled - improves recall significantly
+            if settings.USE_QUERY_VARIATIONS:
+                # Check if we have high-quality chunks (relevance >= 0.4, more lenient)
+                high_quality_count = sum(1 for _, score, _ in retrieved_chunks if score >= 0.4)
+                
+                # Use variations if we don't have enough high-quality chunks OR if best score is low
+                best_score = max((chunk[1] for chunk in retrieved_chunks), default=0.0) if retrieved_chunks else 0.0
+                should_use_variations = high_quality_count < 5 or best_score < 0.5
+                
+                if should_use_variations:
+                    logger.info(f"Trying query variations (high quality: {high_quality_count}, best score: {best_score:.3f})...")
+                    from app.core.rag.query_understanding import QueryUnderstanding
+                    # Use normalized query for variations
+                    query_variations = QueryUnderstanding.generate_query_variations(normalized_query)
+                    # Use top 3 variations for better coverage
+                    query_variations = query_variations[:3]
+                    
+                    # Generate embeddings and retrieve with variations
+                    all_retrieved_chunks = {chunk[0]: chunk for chunk in retrieved_chunks}
+                    
+                    for variation in query_variations:
+                        try:
+                            variation_embedding = embedding_service.generate_embedding(variation)
+                            variation_chunks = await retriever.retrieve(
+                                query_embedding=variation_embedding,
+                                query_text=variation,
+                                top_k=settings.TOP_K_RETRIEVAL,  # Use full TOP_K for variations
+                                document_ids=[str(doc_id) for doc_id in request.document_ids] if request.document_ids else None,
+                                core_area=request.core_area,
+                                factory=request.factory
+                            )
+                            # Merge chunks, keeping highest score
+                            for chunk_id, score, metadata in variation_chunks:
+                                if chunk_id not in all_retrieved_chunks or all_retrieved_chunks[chunk_id][1] < score:
+                                    all_retrieved_chunks[chunk_id] = (chunk_id, score, metadata)
+                        except Exception as e:
+                            logger.warning(f"Failed to retrieve with variation '{variation}': {e}")
+                            continue
+                    
+                    # Convert back to list and sort
+                    retrieved_chunks = list(all_retrieved_chunks.values())
+                    retrieved_chunks.sort(key=lambda x: x[1], reverse=True)
+                    # Allow more chunks after variations (up to 1.5x TOP_K)
+                    retrieved_chunks = retrieved_chunks[:int(settings.TOP_K_RETRIEVAL * 1.5)]
+                    logger.info(f"Retrieved {len(retrieved_chunks)} chunks after variations")
             
-            # If filtering removed all chunks, try with lower threshold or use top results anyway
-            if not filtered_chunks and retrieved_chunks:
-                # Try with even lower threshold (0.1)
+            # Filter chunks by minimum relevance score - more lenient approach
+            # Use adaptive threshold that's more forgiving
+            if not retrieved_chunks:
+                filtered_chunks = []
+            else:
+                # Get the best score available
+                best_score = max(chunk[1] for chunk in retrieved_chunks)
+                
+                # Adaptive threshold: use 60% of best score, but not below 0.2
+                # This ensures we use chunks even if scores are lower than expected
+                adaptive_threshold = max(best_score * 0.6, 0.2, settings.MIN_RELEVANCE_SCORE)
+                
                 filtered_chunks = [
                     chunk for chunk in retrieved_chunks 
-                    if chunk[1] >= 0.1
+                    if chunk[1] >= adaptive_threshold
                 ]
-                # If still nothing, just use top 3 results regardless of score
+                
+                # If still nothing, use top 8 results regardless of score
                 if not filtered_chunks:
-                    filtered_chunks = retrieved_chunks[:3]
-                    # Log that we're using low-relevance chunks
-                    logger.warning(f"Using low-relevance chunks for query: {request.query}")
+                    filtered_chunks = retrieved_chunks[:8]
+                    logger.warning(f"Using top 8 chunks regardless of score - best score was {best_score:.3f}")
+                else:
+                    logger.info(f"Using adaptive threshold {adaptive_threshold:.3f} (best score: {best_score:.3f}, filtered: {len(filtered_chunks)}/{len(retrieved_chunks)})")
             
             if not filtered_chunks:
+                # Provide helpful error message with suggestions
                 raise HTTPException(
                     status_code=404,
-                    detail="No relevant documents found. Please try rephrasing your question or check if the documents contain the information you're looking for."
+                    detail="I'm unable to find relevant information to answer your question. Please try:\n"
+                           "1. Rephrasing your question using different words or terminology\n"
+                           "2. Being more specific about what aspect you're interested in\n"
+                           "3. Breaking down your question into smaller, more focused questions\n"
+                           "4. Checking if the documents you've selected contain the information you need"
                 )
             
             retrieved_chunks = filtered_chunks
             
-            # Generate response
+            # Generate response - use original query for display, but retrieval used normalized
             logger.info("Generating response...")
             generator = RAGGenerator()
             result = await generator.generate_response(
-                query=request.query,
+                query=request.query,  # Use original query for response generation (preserves user's wording)
                 retrieved_chunks=retrieved_chunks,
                 conversation_history=request.conversation_history
             )
@@ -109,8 +231,8 @@ async def send_query(
             logger.info("Saving query and response to database...")
             import json
             async with pool.acquire() as conn:
-                # Convert query embedding to pgvector format
-                query_embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
+                # Convert query embedding to pgvector format (use primary embedding)
+                query_embedding_str = '[' + ','.join(map(str, primary_embedding)) + ']'
                 
                 # Insert query and get created_at
                 query_row = await conn.fetchrow("""
@@ -146,6 +268,9 @@ async def send_query(
             citation_responses = []
             citations = result.get("citations", [])
             
+            # Create a lookup map of chunk_id to score from retrieved_chunks
+            chunk_score_map = {chunk[0]: chunk[1] for chunk in retrieved_chunks}
+            
             for idx, c in enumerate(citations):
                 try:
                     # Handle chunk_id - might be string or UUID
@@ -157,11 +282,21 @@ async def send_query(
                     elif not isinstance(chunk_id, UUID):
                         chunk_id = UUID(str(chunk_id))
                     
+                    # Get relevance score - prefer from citation, fallback to retrieved_chunks, or use default
+                    relevance_score = c.get("relevance_score")
+                    if relevance_score is None or relevance_score == 0:
+                        # Try to get from retrieved_chunks
+                        relevance_score = chunk_score_map.get(str(chunk_id)) or chunk_score_map.get(chunk_id)
+                        if relevance_score is None or relevance_score == 0:
+                            # If still 0, use a reasonable default for cited chunks
+                            relevance_score = 0.5  # Default to medium relevance for cited chunks
+                            logger.warning(f"Citation {idx+1} has no relevance score, using default 0.5")
+                    
                     citation_responses.append(
                         CitationResponse(
                             chunk_id=chunk_id,
                             content=str(c.get("content", ""))[:500],  # Limit content length
-                            relevance_score=float(c.get("relevance_score", 0.0)),
+                            relevance_score=float(relevance_score),
                             rank=idx + 1,
                             metadata=c.get("metadata", {}) or {}
                         )
@@ -176,21 +311,78 @@ async def send_query(
             avg_relevance = 0.0
             if citation_responses:
                 try:
-                    avg_relevance = sum(c.relevance_score for c in citation_responses) / len(citation_responses)
-                except (ZeroDivisionError, TypeError):
-                    avg_relevance = 0.0
+                    relevance_scores = [float(c.relevance_score) for c in citation_responses if c.relevance_score is not None]
+                    if relevance_scores:
+                        avg_relevance = sum(relevance_scores) / len(relevance_scores)
+                        logger.info(f"Average relevance: {avg_relevance:.3f}, Citations: {len(citation_responses)}, Scores: {relevance_scores}")
+                    else:
+                        logger.warning(f"No valid relevance scores in {len(citation_responses)} citations")
+                        # If no valid scores, use a default based on having citations
+                        avg_relevance = 0.5  # Default to medium relevance if citations exist but scores are missing
+                except (ZeroDivisionError, TypeError) as e:
+                    logger.error(f"Error calculating avg relevance: {e}")
+                    avg_relevance = 0.5 if citation_responses else 0.0  # Default to 0.5 if citations exist
+            else:
+                logger.warning("No citations found for relevance calculation")
             
-            # Calculate overall confidence score (weighted combination)
-            # 60% groundedness + 40% average relevance
+            # Calculate overall confidence score - RAG principle: answer is either there or not
+            # If answer has citations, it's grounded in documents = HIGH confidence
+            # If no citations, answer may not be grounded = LOW confidence
             groundedness = result.get("groundedness_score")
             if groundedness is None:
                 groundedness = 1.0  # Default to high if not calculated
+            logger.info(f"Groundedness: {groundedness:.3f}, Avg relevance: {avg_relevance:.3f}, Citations: {len(citation_responses)}")
             
-            # Calculate overall confidence (weighted combination)
-            overall_confidence = (groundedness * 0.6) + (avg_relevance * 0.4)
+            has_citations = len(citation_responses) > 0
             
-            logger.info(f"Query completed successfully. Confidence: {overall_confidence:.2f}")
-            return QueryResponse(
+            # RAG Principle: If answer is cited, it's in the documents = high confidence
+            if has_citations:
+                # Answer has citations = it's grounded in documents
+                # This is the primary signal - trust it
+                citation_count = len(citation_responses)
+                
+                # Base confidence on citation count and groundedness
+                # More citations = more confidence
+                if citation_count >= 3:
+                    # 3+ citations = very well supported
+                    overall_confidence = 0.95  # Start high
+                elif citation_count >= 2:
+                    # 2 citations = well supported
+                    overall_confidence = 0.90  # Start high
+                elif citation_count >= 1:
+                    # 1 citation = supported
+                    overall_confidence = 0.85  # Start high
+                
+                # Adjust slightly based on groundedness (but don't penalize too much)
+                # If groundedness is very high, boost a bit
+                if groundedness >= 0.8:
+                    overall_confidence = min(overall_confidence + 0.05, 1.0)  # Small boost
+                elif groundedness < 0.6:
+                    # Lower groundedness - slight reduction but still high
+                    overall_confidence = max(overall_confidence - 0.05, 0.80)  # Small reduction, keep high
+                
+                # Ensure minimum based on citations
+                if citation_count >= 2:
+                    overall_confidence = max(overall_confidence, 0.88)  # High minimum for 2+ citations
+                else:
+                    overall_confidence = max(overall_confidence, 0.85)  # High minimum for 1 citation
+            else:
+                # No citations = answer may not be grounded
+                # Use groundedness as primary signal
+                if groundedness >= 0.7:
+                    overall_confidence = 0.75  # Medium-high if well-grounded but no explicit citations
+                elif groundedness >= 0.5:
+                    overall_confidence = 0.60  # Medium if somewhat grounded
+                else:
+                    overall_confidence = 0.40  # Low if not well-grounded
+            
+            # Cap at 1.0
+            overall_confidence = min(overall_confidence, 1.0)
+            
+            logger.info(f"Query completed successfully. Final confidence: {overall_confidence:.2f} (groundedness: {groundedness:.3f}, avg_relevance: {avg_relevance:.3f}, citations: {len(citation_responses)})")
+            
+            # Create response object
+            response = QueryResponse(
                 query_id=query_id,
                 response_text=result["response_text"],
                 citations=citation_responses,
@@ -202,6 +394,35 @@ async def send_query(
                 avg_relevance_score=avg_relevance,
                 overall_confidence=overall_confidence
             )
+            
+            # Cache the response
+            if settings.CACHE_ENABLED:
+                try:
+                    cache_data = {
+                        "query_id": str(query_id),
+                        "response_text": result["response_text"],
+                        "citations": [c.dict() for c in citation_responses],
+                        "model": generator.model,
+                        "tokens_used": result["tokens_used"],
+                        "latency_ms": result["latency_ms"],
+                        "created_at": created_at.isoformat() if created_at else None,
+                        "groundedness_score": float(groundedness) if groundedness is not None else 0.0,
+                        "avg_relevance_score": float(avg_relevance) if avg_relevance is not None else 0.0,
+                        "overall_confidence": float(overall_confidence)  # Ensure it's stored as float
+                    }
+                    logger.info(f"Storing in cache with confidence: {overall_confidence:.2f}")
+                    await cache_service.set(
+                        query=normalized_query,  # Use normalized query for cache key (typos share same cache)
+                        response_data=cache_data,
+                        ttl_seconds=settings.CACHE_TTL_SECONDS,
+                        document_ids=[str(doc_id) for doc_id in request.document_ids] if request.document_ids else None,
+                        core_area=request.core_area,
+                        factory=request.factory
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to cache response: {e}")
+            
+            return response
         except HTTPException:
             raise
         except Exception as e:
@@ -288,7 +509,15 @@ async def submit_feedback(
         learning_service = LearningService(pool)
         await learning_service.learn_from_interaction(request.query_id, request.feedback)
     
-    return {"message": "Feedback submitted", "query_id": str(request.query_id)}
+    # Return thank you message based on feedback type
+    if request.feedback == 1:
+        message = "Thank you for your positive feedback! We're glad this response was helpful."
+    elif request.feedback == -1:
+        message = "Thank you for your feedback. We'll use this to improve our responses."
+    else:
+        message = "Thank you for your feedback!"
+    
+    return {"message": message, "query_id": str(request.query_id)}
 
 
 @router.get("/citations/{query_id}")
@@ -337,4 +566,38 @@ async def get_query_suggestions(
     suggestions = await learning_service.get_query_suggestions(query, limit)
     
     return {"suggestions": suggestions}
+
+
+@router.get("/cache/stats")
+async def get_cache_stats():
+    """
+    Get cache statistics
+    """
+    from app.core.cache import get_cache_service
+    cache_service = get_cache_service()
+    stats = cache_service.get_stats()
+    return stats
+
+
+@router.delete("/cache")
+async def clear_cache(
+    query: Optional[str] = Query(None),
+    all: bool = Query(False, description="Clear all cache entries")
+):
+    """
+    Clear cache entries
+    If query is provided, clears that specific query's cache.
+    If all=true, clears all cache entries (use with caution).
+    """
+    from app.core.cache import get_cache_service
+    cache_service = get_cache_service()
+    
+    if all:
+        await cache_service.invalidate()  # Clear all
+        return {"message": "All cache entries cleared"}
+    elif query:
+        await cache_service.invalidate(query=query)
+        return {"message": f"Cache cleared for query: {query}"}
+    else:
+        return {"message": "Please provide a query parameter or set all=true"}
 
