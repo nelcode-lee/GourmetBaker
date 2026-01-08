@@ -12,33 +12,26 @@ class QueryNormalizer:
     """
     
     # Common typos and corrections for technical terms
+    # NOTE: Don't convert plurals to singulars - keep both forms for better matching
     COMMON_TYPOS = {
-        # Technical terms
+        # Technical terms - only fix actual typos, not plural/singular
         'guidlines': 'guidelines',
         'guidline': 'guideline',
-        'standards': 'standard',  # Keep plural forms
         'requirment': 'requirement',
         'requirments': 'requirements',
-        'procedures': 'procedure',
         'procedur': 'procedure',
         'temprature': 'temperature',
         'tempature': 'temperature',
-        'hygiene': 'hygiene',  # Common misspelling
         'hygene': 'hygiene',
-        'certificates': 'certificate',
         'certificat': 'certificate',
         'certifcate': 'certificate',
         'descripton': 'description',
         'descriptin': 'description',
-        'reports': 'report',
         'repots': 'reports',
-        'storage': 'storage',
         'storag': 'storage',
-        'monitoring': 'monitor',
         'monitering': 'monitoring',
         'maintainance': 'maintenance',
         'maintainence': 'maintenance',
-        'sanitization': 'sanitize',
         'sanitisation': 'sanitization',
     }
     
@@ -221,4 +214,5 @@ class QueryNormalizer:
         # Reconstruct query with expanded terms
         # For now, just return normalized - expansion happens in query variations
         return normalized
+
 

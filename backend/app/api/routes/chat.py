@@ -180,29 +180,34 @@ async def send_query(
                     retrieved_chunks = retrieved_chunks[:int(settings.TOP_K_RETRIEVAL * 1.5)]
                     logger.info(f"Retrieved {len(retrieved_chunks)} chunks after variations")
             
-            # Filter chunks by minimum relevance score - more lenient approach
-            # Use adaptive threshold that's more forgiving
+            # Filter chunks by minimum relevance score - very lenient approach
+            # Use adaptive threshold that's very forgiving to catch simple questions
             if not retrieved_chunks:
                 filtered_chunks = []
             else:
                 # Get the best score available
                 best_score = max(chunk[1] for chunk in retrieved_chunks)
                 
-                # Adaptive threshold: use 60% of best score, but not below 0.2
+                # Very adaptive threshold: use 50% of best score, but not below 0.15
                 # This ensures we use chunks even if scores are lower than expected
-                adaptive_threshold = max(best_score * 0.6, 0.2, settings.MIN_RELEVANCE_SCORE)
+                # For simple questions, we want to be very inclusive
+                adaptive_threshold = max(best_score * 0.5, 0.15, settings.MIN_RELEVANCE_SCORE)
                 
                 filtered_chunks = [
                     chunk for chunk in retrieved_chunks 
                     if chunk[1] >= adaptive_threshold
                 ]
                 
-                # If still nothing, use top 8 results regardless of score
+                # If still nothing, use top 10 results regardless of score (increased from 8)
                 if not filtered_chunks:
-                    filtered_chunks = retrieved_chunks[:8]
-                    logger.warning(f"Using top 8 chunks regardless of score - best score was {best_score:.3f}")
+                    filtered_chunks = retrieved_chunks[:10]
+                    logger.warning(f"Using top 10 chunks regardless of score - best score was {best_score:.3f}")
                 else:
-                    logger.info(f"Using adaptive threshold {adaptive_threshold:.3f} (best score: {best_score:.3f}, filtered: {len(filtered_chunks)}/{len(retrieved_chunks)})")
+                    logger.info(f"Retrieved {len(retrieved_chunks)} chunks, filtered to {len(filtered_chunks)} using threshold {adaptive_threshold:.3f} (best score: {best_score:.3f})")
+                    # Log top 3 chunks for debugging
+                    for i, (chunk_id, score, metadata) in enumerate(filtered_chunks[:3]):
+                        content_preview = metadata.get('content', '')[:100].replace('\n', ' ')
+                        logger.info(f"  Top chunk {i+1}: score={score:.3f}, preview='{content_preview}...'")
             
             if not filtered_chunks:
                 # Provide helpful error message with suggestions
@@ -298,6 +303,10 @@ async def send_query(
                             content=str(c.get("content", ""))[:500],  # Limit content length
                             relevance_score=float(relevance_score),
                             rank=idx + 1,
+                            document=c.get("document"),
+                            chapter=c.get("chapter"),
+                            page_number=c.get("page_number"),
+                            citation_string=c.get("citation_string"),  # Formatted: "Document, Chapter, Page X"
                             metadata=c.get("metadata", {}) or {}
                         )
                     )

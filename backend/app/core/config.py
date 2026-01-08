@@ -25,8 +25,8 @@ class Settings(BaseSettings):
     # RAG Parameters
     CHUNK_SIZE: int = 512
     CHUNK_OVERLAP: int = 50
-    TOP_K_RETRIEVAL: int = 12  # Increased to get more candidates for better coverage
-    MIN_RELEVANCE_SCORE: float = 0.3  # Lowered to 0.3 to catch more relevant chunks (was 0.5, too strict)
+    TOP_K_RETRIEVAL: int = 15  # Increased to get more candidates for better coverage
+    MIN_RELEVANCE_SCORE: float = 0.2  # Lowered to 0.2 to catch more relevant chunks (was 0.3, still too strict)
     USE_QUERY_VARIATIONS: bool = True  # Enable by default for better query understanding
     
     # Redis

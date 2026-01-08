@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { analyticsAPI } from '../../services/api'
-import { DocumentQueryStats, KeyTermStats, QualityMetrics } from '../../types'
+import { KeyTermStats, QualityMetrics } from '../../types'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, PieChart, Pie, Cell } from 'recharts'
 
 export default function AnalyticsDashboard() {
@@ -28,14 +28,6 @@ export default function AnalyticsDashboard() {
     },
   })
 
-  const { data: documentQueryStats, isLoading: docQueriesLoading } = useQuery({
-    queryKey: ['analytics-document-queries'],
-    queryFn: async () => {
-      const response = await analyticsAPI.getQueriesByDocuments()
-      return response.data
-    },
-  })
-
   const { data: keyTermStats, isLoading: keyTermsLoading } = useQuery({
     queryKey: ['analytics-key-terms'],
     queryFn: async () => {
@@ -55,7 +47,7 @@ export default function AnalyticsDashboard() {
   })
 
   // Show partial results - don't block on all queries
-  const isLoading = overviewLoading || patternsLoading || usageLoading || docQueriesLoading || keyTermsLoading || qualityLoading
+  const isLoading = overviewLoading || patternsLoading || usageLoading || keyTermsLoading || qualityLoading
 
   // Prepare data for donut charts
   const COLORS = {
@@ -198,6 +190,7 @@ export default function AnalyticsDashboard() {
           </div>
         )}
         {!qualityLoading && !qualityError && qualityMetrics && (
+        <>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
           {/* Feedback Distribution */}
           <div className="flex flex-col items-center">
@@ -390,6 +383,7 @@ export default function AnalyticsDashboard() {
             </p>
           </div>
         </div>
+        </>
         )}
       </div>
 
@@ -418,153 +412,6 @@ export default function AnalyticsDashboard() {
             {((overview?.positive_feedback_ratio || 0) * 100).toFixed(1)}%
           </p>
         </div>
-      </div>
-
-      <div className="bg-white rounded-lg shadow p-6">
-        <h2 className="text-xl font-semibold mb-2">Queries by Document</h2>
-        <p className="text-sm text-gray-500 mb-4">
-          Shows which documents are queried most frequently and their performance metrics
-        </p>
-        {documentQueryStats && documentQueryStats.length > 0 ? (
-          <div>
-            <ResponsiveContainer width="100%" height={500}>
-              <BarChart 
-                data={documentQueryStats.slice(0, 15)} 
-                margin={{ bottom: 120, left: 20, right: 20, top: 20 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis 
-                  dataKey="filename" 
-                  angle={-45} 
-                  textAnchor="end" 
-                  height={180}
-                  tick={{ fontSize: 9 }}
-                  interval={0}
-                  tickFormatter={(value) => {
-                    // Truncate long filenames to prevent overlap
-                    if (value.length > 30) {
-                      return value.substring(0, 27) + '...'
-                    }
-                    return value
-                  }}
-                />
-                <YAxis yAxisId="left" />
-                <YAxis yAxisId="right" orientation="right" domain={[0, 1]} />
-                <Tooltip 
-                  formatter={(value: any, name: string) => {
-                    if (name === 'query_count') return [value, 'Queries']
-                    if (name === 'avg_relevance_score') return [`${(value * 100).toFixed(1)}%`, 'Avg Relevance']
-                    if (name === 'positive_feedback_count') return [value, '👍 Positive']
-                    if (name === 'negative_feedback_count') return [value, '👎 Negative']
-                    return [value, name]
-                  }}
-                  labelFormatter={(label, payload) => {
-                    if (payload && payload[0]) {
-                      const data = payload[0].payload as DocumentQueryStats
-                      return data.filename
-                    }
-                    return label
-                  }}
-                />
-                <Legend />
-                <Bar 
-                  yAxisId="left"
-                  dataKey="query_count" 
-                  fill="#3b82f6" 
-                  name="Query Count"
-                  radius={[4, 4, 0, 0]}
-                />
-                <Bar 
-                  yAxisId="right"
-                  dataKey="avg_relevance_score" 
-                  fill="#10b981" 
-                  name="Avg Relevance"
-                  radius={[4, 4, 0, 0]}
-                />
-                <Bar 
-                  yAxisId="left"
-                  dataKey="positive_feedback_count" 
-                  fill="#22c55e" 
-                  name="👍 Positive"
-                  radius={[4, 4, 0, 0]}
-                />
-                <Bar 
-                  yAxisId="left"
-                  dataKey="negative_feedback_count" 
-                  fill="#ef4444" 
-                  name="👎 Negative"
-                  radius={[4, 4, 0, 0]}
-                />
-              </BarChart>
-            </ResponsiveContainer>
-            
-            {/* Document summary cards */}
-            <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="bg-gray-50 rounded-lg p-4">
-                <h3 className="text-sm font-medium text-gray-700 mb-2">Most Queried Document</h3>
-                <p className="text-lg font-bold text-gray-900 truncate" title={documentQueryStats[0]?.filename}>
-                  {documentQueryStats[0]?.filename || 'N/A'}
-                </p>
-                <p className="text-xs text-gray-500 mt-1">
-                  {documentQueryStats[0]?.query_count || 0} queries
-                </p>
-              </div>
-              <div className="bg-gray-50 rounded-lg p-4">
-                <h3 className="text-sm font-medium text-gray-700 mb-2">Total Documents Queried</h3>
-                <p className="text-2xl font-bold text-gray-900">{documentQueryStats.length}</p>
-                <p className="text-xs text-gray-500 mt-1">
-                  Documents with query activity
-                </p>
-              </div>
-              <div className="bg-gray-50 rounded-lg p-4">
-                <h3 className="text-sm font-medium text-gray-700 mb-2">Total Queries</h3>
-                <p className="text-2xl font-bold text-gray-900">
-                  {documentQueryStats.reduce((sum: number, d: DocumentQueryStats) => sum + d.query_count, 0)}
-                </p>
-                <p className="text-xs text-gray-500 mt-1">
-                  Across all documents
-                </p>
-              </div>
-            </div>
-            
-            {/* Document list with details */}
-            <div className="mt-6 space-y-2">
-              <h3 className="text-sm font-medium text-gray-700 mb-3">Document Details</h3>
-              {documentQueryStats.slice(0, 10).map((doc: DocumentQueryStats) => (
-                <div key={doc.document_id} className="flex justify-between items-center p-3 bg-gray-50 rounded-lg">
-                  <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900 truncate">{doc.filename}</p>
-                    <div className="flex gap-2 mt-1">
-                      {doc.core_area && (
-                        <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-800 rounded">
-                          {doc.core_area}
-                        </span>
-                      )}
-                      {doc.factory && (
-                        <span className="text-xs px-2 py-0.5 bg-green-100 text-green-800 rounded">
-                          {doc.factory}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="text-right text-sm text-gray-600">
-                    <p>{doc.query_count} queries</p>
-                    <p className="text-xs">
-                      {(doc.avg_relevance_score * 100).toFixed(1)}% relevance
-                    </p>
-                    <p className="text-xs mt-1">
-                      👍 {doc.positive_feedback_count} • 👎 {doc.negative_feedback_count}
-                    </p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <p className="text-gray-500 text-center py-8">
-            No document query data yet. Make some queries to see which documents are accessed most frequently.
-          </p>
-        )}
       </div>
 
       <div className="bg-white rounded-lg shadow p-6">

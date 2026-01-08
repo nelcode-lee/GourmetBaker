@@ -143,13 +143,18 @@ class HybridRetriever:
                 keyword_score = (keyword_score - (min(score for _, score in keyword_results) if keyword_results else 0)) / keyword_range
             keyword_score = min(max(keyword_score, 0), 1)
             
-            # Combine with weights - boost keyword matches for specific queries
-            # If keyword score is high, it's likely a good match
-            if keyword_score > 0.5:
-                # Boost keyword-heavy matches
+            # Combine with weights - heavily boost keyword matches (they're more reliable for simple questions)
+            # If keyword score is high, it's likely a good match - trust it more
+            if keyword_score > 0.4:  # Lowered threshold from 0.5 to catch more matches
+                # Heavily boost keyword-heavy matches - keyword search is more reliable for exact matches
                 combined_score = (
-                    self.vector_weight * vector_score * 0.7 +  # Slightly reduce vector weight
-                    self.keyword_weight * keyword_score * 1.3  # Boost keyword weight
+                    self.vector_weight * vector_score * 0.5 +  # Reduce vector weight more
+                    self.keyword_weight * keyword_score * 1.5   # Boost keyword weight more
+                )
+            elif keyword_score > 0.2:  # Even moderate keyword matches should be boosted
+                combined_score = (
+                    self.vector_weight * vector_score * 0.6 +
+                    self.keyword_weight * keyword_score * 1.3
                 )
             else:
                 combined_score = (
@@ -157,10 +162,11 @@ class HybridRetriever:
                     self.keyword_weight * keyword_score
                 )
             
-            # Ensure minimum score if either search found something
-            # But don't artificially inflate low scores - let them be low
-            # Only set minimum if we have a reasonable match
-            if (vector_score > 0.3 or keyword_score > 0.3):
+            # Ensure minimum score if either search found something - be more generous
+            # For simple questions, keyword matches are very important
+            if keyword_score > 0.2:  # Lowered threshold - any keyword match is valuable
+                combined_score = max(combined_score, 0.3)  # Higher minimum (was 0.2) for keyword matches
+            elif vector_score > 0.3 or keyword_score > 0.1:
                 combined_score = max(combined_score, 0.2)  # Minimum 0.2 for reasonable matches
             
             final_results.append((chunk_id, combined_score))
@@ -310,16 +316,27 @@ class HybridRetriever:
         # Extract keywords from both original and normalized query
         stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'what', 'are', 'were', 'was', 'should', 'include'}
         
-        # Get keywords from normalized query
+        # Get keywords from normalized query - be more inclusive
         words = re.findall(r'\b[a-z0-9]+\b', normalized_query.lower())
-        keywords = [w for w in words if w not in stop_words and len(w) > 2]
+        # Lower minimum length to 2 (was 3) to catch short important words
+        keywords = [w for w in words if w not in stop_words and len(w) >= 2]
+        
+        # Also get keywords from original query (in case normalization removed something)
+        original_words = re.findall(r'\b[a-z0-9]+\b', query_text.lower())
+        original_keywords = [w for w in original_words if w not in stop_words and len(w) >= 2]
+        keywords.extend(original_keywords)
         
         # Also get fuzzy keyword variations for better matching
         fuzzy_keywords = QueryNormalizer.generate_fuzzy_keywords(query_text)
-        fuzzy_keywords = [w for w in fuzzy_keywords if w not in stop_words and len(w) > 2]
+        fuzzy_keywords = [w for w in fuzzy_keywords if w not in stop_words and len(w) >= 2]
         
-        # Combine and deduplicate
+        # Combine and deduplicate - keep all variations
         all_keywords = list(set(keywords + fuzzy_keywords))
+        
+        # Log keywords for debugging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Keyword search for '{query_text}': {len(all_keywords)} keywords: {all_keywords[:10]}")
         
         # Extract important phrases - improved to capture key concepts
         phrases = []
@@ -443,30 +460,39 @@ class HybridRetriever:
                     for i in range(len(keywords))
                 ])
             
+            # More lenient query - don't use GROUP BY/HAVING which can filter out results
+            # Instead, calculate score directly and include all matches
             query = f"""
-                SELECT dc.id,
+                SELECT DISTINCT dc.id,
                        ({score_expr}) as score
                 FROM document_chunks dc
                 JOIN documents d ON dc.document_id = d.id
                 WHERE {where_clause}
-                GROUP BY dc.id
-                HAVING ({score_expr}) > 0
                 ORDER BY score DESC
                 LIMIT ${param_idx}
             """
             
             rows = await conn.fetch(query, *params)
             
-            # Normalize scores (simple approach)
+            # Normalize scores (simple approach) - be more generous
             results = []
             if rows:
                 max_score = max(float(row["score"]) for row in rows) or 1.0
+                min_score = min(float(row["score"]) for row in rows) or 0.0
+                score_range = max_score - min_score if max_score > min_score else 1.0
+                
                 for row in rows:
-                    # Normalize and boost scores (ensure minimum 0.2 for any match)
-                    normalized_score = min(float(row["score"]) / max_score, 1.0)
-                    # Boost: if score > 0, ensure it's at least 0.2
+                    raw_score = float(row["score"])
+                    # Normalize to 0-1 range
+                    if score_range > 0:
+                        normalized_score = (raw_score - min_score) / score_range
+                    else:
+                        normalized_score = 0.5 if raw_score > 0 else 0.0
+                    
+                    # Be more generous: any match gets at least 0.3 (was 0.2)
                     if normalized_score > 0:
-                        normalized_score = max(normalized_score, 0.2)
+                        normalized_score = max(normalized_score, 0.3)
+                    
                     results.append((str(row["id"]), normalized_score))
             
             return results

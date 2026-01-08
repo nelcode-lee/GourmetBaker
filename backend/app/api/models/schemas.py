@@ -69,6 +69,10 @@ class CitationResponse(BaseModel):
     content: str
     relevance_score: float
     rank: int
+    document: Optional[str] = None  # Document filename
+    chapter: Optional[str] = None  # Chapter or section name
+    page_number: Optional[int] = None  # Page number
+    citation_string: Optional[str] = None  # Formatted citation: "Document, Chapter, Page X"
     metadata: Optional[Dict[str, Any]] = None
 
 

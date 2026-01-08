@@ -67,8 +67,50 @@ class RAGGenerator:
             tokens_used = response.usage.total_tokens if response.usage else 0
             latency_ms = int((time.time() - start_time) * 1000)
             
+            # Log response for debugging
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"LLM Response (first 500 chars): {response_text[:500]}")
+            
             # Extract citations from response
             citations = self._extract_citations(response_text, retrieved_chunks)
+            
+            # Fallback: If no citations found but we have chunks, include at least the top chunk
+            if not citations and retrieved_chunks:
+                logger.warning(f"No citations found in response, adding top chunk as fallback citation")
+                # Add the top chunk as a citation
+                top_chunk = retrieved_chunks[0]
+                chunk_id, score, metadata = top_chunk
+                
+                # Build citation from top chunk
+                filename = metadata.get("filename", "Unknown")
+                chapter_section = ""
+                if "headers" in metadata and metadata["headers"]:
+                    chapter_section = metadata["headers"][0]
+                elif "chapter" in metadata and metadata["chapter"]:
+                    chapter_section = f"Chapter {metadata['chapter']}"
+                elif "section" in metadata and metadata["section"]:
+                    chapter_section = f"Section {metadata['section']}"
+                
+                page_number = metadata.get("page_number", None)
+                citation_parts = [filename]
+                if chapter_section:
+                    citation_parts.append(chapter_section)
+                if page_number:
+                    citation_parts.append(f"Page {page_number}")
+                citation_string = ", ".join(citation_parts)
+                
+                citations.append({
+                    "chunk_id": chunk_id,
+                    "relevance_score": float(score) if score else 0.5,
+                    "content": metadata.get("content", "")[:200],
+                    "document": filename,
+                    "chapter": chapter_section if chapter_section else None,
+                    "page_number": page_number,
+                    "citation_string": citation_string,
+                    "metadata": metadata
+                })
+                logger.info(f"Added fallback citation: {citation_string}")
             
             # Validate response groundedness
             groundedness_score = self._validate_groundedness(response_text, retrieved_chunks)
@@ -103,15 +145,29 @@ class RAGGenerator:
             if len(content) > 1500:
                 content = content[:1500] + "..."
             
-            # Include relevance score and source info in context
+            # Include relevance score and source info in context with document, chapter, and page
             filename = metadata.get("filename", "Unknown")
-            page_info = ""
-            if "page_number" in metadata:
-                page_info = f" (Page {metadata['page_number']})"
-            elif "headers" in metadata and metadata["headers"]:
-                page_info = f" (Section: {metadata['headers'][0]})"
             
-            context_parts.append(f"[{idx}] Source: {filename}{page_info}\nRelevance: {score:.2f}\nContent: {content}")
+            # Build citation info: Document, Chapter/Section, Page
+            page_info = ""
+            chapter_info = ""
+            
+            if "page_number" in metadata and metadata["page_number"]:
+                page_info = f", Page {metadata['page_number']}"
+            
+            # Get chapter/section information
+            if "headers" in metadata and metadata["headers"]:
+                # Use the first header as chapter/section
+                chapter_info = f", {metadata['headers'][0]}"
+            elif "chapter" in metadata and metadata["chapter"]:
+                chapter_info = f", Chapter {metadata['chapter']}"
+            elif "section" in metadata and metadata["section"]:
+                chapter_info = f", Section {metadata['section']}"
+            
+            # Format: [1] Document: filename, Chapter/Section, Page X
+            citation_info = f"Document: {filename}{chapter_info}{page_info}" if (chapter_info or page_info) else f"Document: {filename}"
+            
+            context_parts.append(f"[{idx}] {citation_info}\nRelevance: {score:.2f}\nContent: {content}")
         return "\n\n".join(context_parts)
     
     def _build_messages(
@@ -120,29 +176,39 @@ class RAGGenerator:
         context: str,
         history: Optional[List[Dict]] = None
     ) -> List[Dict]:
-        """Build messages for OpenAI chat API with strict grounding requirements"""
+        """Build messages for OpenAI chat API with balanced grounding requirements"""
         messages = [
             {
                 "role": "system",
-                "content": """You are a technical documentation assistant for Cranswick. Your responses MUST be 100% accurate and based EXCLUSIVELY on the provided context.
+                "content": """You are a helpful technical documentation assistant for Cranswick. Your goal is to provide accurate, useful answers based on the provided context.
 
-CRITICAL RULES - FOLLOW STRICTLY:
-1. ONLY use information that is EXPLICITLY and DIRECTLY stated in the provided context
-2. NEVER make up, infer, assume, or extrapolate information not explicitly in the context
-3. NEVER use general knowledge or information from outside the provided context
-4. ALWAYS cite sources using [1], [2], etc. for EVERY factual claim you make
-5. If the context doesn't contain enough information to answer, you MUST provide a helpful response that:
-   - Clearly states: "I'm unable to answer this question based on the available documents."
-   - Suggests: "Please try rephrasing your question or asking about a specific aspect of the topic."
-   - Offers alternatives: "You might try asking about related topics such as [suggest 2-3 related topics based on what IS in the context]."
-6. Do NOT combine information from multiple sources unless the context explicitly shows they should be combined
-7. Do NOT paraphrase in ways that change meaning - quote or closely paraphrase the exact wording from context
-8. If you're uncertain about ANY detail, state that clearly: "The context does not provide clear information about [specific detail]"
-9. If the question is unclear or ambiguous, try to understand the intent and provide what information IS available, or suggest how to clarify the question
-10. Check the relevance scores - lower scores may be less reliable
-11. If the question seems to be asking about something that might be phrased differently, mention what related information IS available in the context
+CORE PRINCIPLES:
+1. Base your answers on the provided context - use information from the documents to answer questions
+2. ALWAYS cite at least one source with document name, chapter/section, and page number using format: [1] Document: filename, Chapter/Section, Page X
+3. Every factual claim MUST include a citation with document, chapter, and page number
+4. If information is clearly present in the context, provide a helpful answer even if you need to infer connections between related concepts
+5. Be helpful and proactive - try to understand what the user is asking and provide relevant information from the context
+6. If the question uses different terminology than the documents, look for related concepts and provide what IS available
 
-ACCURACY IS PARAMOUNT. When in doubt, say the information is not available in the provided context. It is better to say "not available" than to guess or make up information. However, always be helpful by suggesting how the user might rephrase their question or what related information is available."""
+WHEN TO ANSWER:
+- If the context contains information that addresses the question (even if phrased differently), provide an answer with citations
+- If the question asks about a concept that's discussed in the context, explain it using the context
+- If multiple related pieces of information exist, synthesize them to provide a complete answer
+- If the question is partially answerable, provide what you can and note any limitations
+
+WHEN TO SAY "UNABLE TO ANSWER":
+- Only if the context truly contains NO relevant information about the question topic
+- If you've thoroughly searched the context and found nothing related
+- In this case, be helpful: suggest related topics that ARE in the context, or suggest rephrasing
+
+BEST PRACTICES:
+- Cite sources [1], [2], etc. for all factual claims - this is how we measure accuracy
+- Quote or closely paraphrase the context when possible
+- If information is in multiple sources, cite all relevant ones
+- If relevance scores are low (<0.4), mention this but still use the information if it's the best available
+- Be conversational and helpful - users want answers, not refusals
+
+Remember: Your goal is to be helpful while maintaining accuracy through citations. If information exists in the context, use it to answer the question."""
             }
         ]
         
@@ -154,28 +220,30 @@ ACCURACY IS PARAMOUNT. When in doubt, say the information is not available in th
                 if h.get("assistant"):
                     messages.append({"role": "assistant", "content": h["assistant"]})
         
-        # Add current context and query with strict instructions
-        user_message = f"""You are answering a question about technical standards documents. Use ONLY the following context. Do NOT use any information outside this context.
+        # Add current context and query with helpful instructions
+        user_message = f"""Answer the following question using the provided context from technical standards documents.
 
 CONTEXT (with relevance scores):
 {context}
 
 QUESTION: {query}
 
-STRICT INSTRUCTIONS:
-1. Answer ONLY using information EXPLICITLY stated in the context above
-2. Cite EVERY factual statement with [1], [2], etc. matching the source numbers
-3. If the answer is not in the context, provide a HELPFUL response:
-   - State clearly: "I'm unable to answer this question based on the available documents."
-   - Suggest rephrasing: "Please try asking your question in a different way, or be more specific about what aspect you're interested in."
-   - Offer alternatives: Based on what IS in the context, suggest 2-3 related topics or questions the user might ask instead
-4. If the question is unclear or could be interpreted multiple ways, acknowledge this and provide what information IS available, or ask for clarification
-5. Do NOT make assumptions, inferences, or add information not in the context
-6. Do NOT use general knowledge - only what's in the provided context
-7. If you see low relevance scores (<0.5), be extra cautious with that information
-8. Quote or closely paraphrase the exact wording from the context when possible
-9. If multiple sources conflict, mention this explicitly
-10. Try to understand the user's intent - if the question is phrased in a way that might not match the document terminology, look for related concepts in the context"""
+INSTRUCTIONS:
+1. Provide a helpful answer based on the context above - if information exists that addresses the question, use it
+2. ALWAYS include at least one citation number [1], [2], [3], etc. in your response - these numbers correspond to the sources in the context above
+3. Example: If you use information from the first source [1], write something like: "According to the document [1], the temperature requirement is..."
+4. Every factual statement MUST include a citation number [1], [2], etc. from the context
+5. The context shows sources numbered [1], [2], [3] etc. - use these EXACT numbers in your response
+6. If the question uses different words than the documents, look for related concepts and provide what information IS available
+7. If you can partially answer the question, provide what you can and note any limitations
+8. If the context truly contains no relevant information, then say: "I'm unable to answer this question based on the available documents. However, the documents do contain information about [suggest 2-3 related topics from the context]."
+9. Be helpful and conversational - users want answers, so provide them when the information exists
+10. If multiple sources discuss the topic, cite all relevant ones using [1], [2], etc.
+11. If relevance scores are low (<0.4), you can still use the information but mention it's from lower-relevance sources
+12. Quote or paraphrase the context accurately when possible
+13. If the question is unclear, provide what information IS available and ask for clarification if needed
+
+CRITICAL: You MUST include at least one citation number [1], [2], [3], etc. in your response. These numbers MUST appear in your answer text. For example: "The temperature requirement is 4°C [1]" or "According to [1], the procedure requires..." DO NOT write citations in a separate format - include the numbers [1], [2] directly in your response text."""
         
         messages.append({"role": "user", "content": user_message})
         
@@ -192,11 +260,23 @@ STRICT INSTRUCTIONS:
         
         citations = []
         # Find all citation references like [1], [2], etc.
+        # Also try variations: (1), [source 1], etc.
         citation_pattern = r'\[(\d+)\]'
         matches = re.findall(citation_pattern, response_text)
         
-        cited_indices = set(int(m) - 1 for m in matches if int(m) <= len(retrieved_chunks))
-        logger.info(f"Found {len(cited_indices)} citation references in response, {len(retrieved_chunks)} chunks available")
+        # Also try parentheses format (1), (2)
+        paren_pattern = r'\((\d+)\)'
+        paren_matches = re.findall(paren_pattern, response_text)
+        
+        # Combine both patterns
+        all_matches = matches + paren_matches
+        
+        cited_indices = set(int(m) - 1 for m in all_matches if int(m) <= len(retrieved_chunks) and int(m) > 0)
+        logger.info(f"Found {len(cited_indices)} citation references in response (pattern matches: {len(matches)} [brackets], {len(paren_matches)} parentheses), {len(retrieved_chunks)} chunks available")
+        
+        # Log if no citations found
+        if not cited_indices:
+            logger.warning(f"No citation references found in response text. Response preview: {response_text[:300]}")
         
         for idx in cited_indices:
             if 0 <= idx < len(retrieved_chunks):
@@ -208,10 +288,38 @@ STRICT INSTRUCTIONS:
                     logger.warning(f"Citation [{idx+1}] has zero or None relevance score, using minimum 0.3")
                     score = 0.3  # Use minimum score if somehow 0
                 
+                # Build citation with document, chapter, and page number
+                filename = metadata.get("filename", "Unknown")
+                
+                # Get chapter/section information
+                chapter_section = ""
+                if "headers" in metadata and metadata["headers"]:
+                    chapter_section = metadata["headers"][0]
+                elif "chapter" in metadata and metadata["chapter"]:
+                    chapter_section = f"Chapter {metadata['chapter']}"
+                elif "section" in metadata and metadata["section"]:
+                    chapter_section = f"Section {metadata['section']}"
+                
+                # Get page number
+                page_number = metadata.get("page_number", None)
+                
+                # Build citation string
+                citation_parts = [filename]
+                if chapter_section:
+                    citation_parts.append(chapter_section)
+                if page_number:
+                    citation_parts.append(f"Page {page_number}")
+                
+                citation_string = ", ".join(citation_parts)
+                
                 citations.append({
                     "chunk_id": chunk_id,
                     "relevance_score": float(score),  # Ensure it's a float
                     "content": metadata.get("content", "")[:200],  # Preview
+                    "document": filename,
+                    "chapter": chapter_section if chapter_section else None,
+                    "page_number": page_number,
+                    "citation_string": citation_string,  # Formatted: "Document, Chapter, Page X"
                     "metadata": metadata
                 })
         
